@@ -36,11 +36,6 @@ Install the Goodies
 Time to equip your snake with its tools. Run this command to install the required libraries:
 bash
 
-Collapse
-
-Wrap
-
-Copy
 pip install pygame numpy torch
 Pygame: Renders the snake’s world in glorious pixels. 🎨
 NumPy: Crunches numbers like a champ. 🧮
@@ -50,22 +45,12 @@ Test Your Setup
 Make sure everything’s in place with this quick check:
 bash
 
-Collapse
-
-Wrap
-
-Copy
 python -c "import pygame, numpy, torch; print('Ready to roll! 🐍')"
 If you see “Ready to roll! 🐍”, you’re golden! If not, double-check your installs.
 GPU Bonus Round
 Got an NVIDIA GPU? Let’s make sure it’s ready to rumble:
 bash
 
-Collapse
-
-Wrap
-
-Copy
 python -c "import torch; print('GPU Ready!' if torch.cuda.is_available() else 'No GPU, but we’ll manage!')"
 “GPU Ready!” means you’re in for a fast ride. Otherwise, the CPU will still get the job done—just a bit slower. 🏎️
 🎮 How to Play (or Watch the AI Show Off!)
@@ -74,13 +59,6 @@ SnakeNN offers two ways to enjoy the action. Pick your poison! ☕
 1. Manual Mode
 Take the reins and steer the snake yourself!
 
-bash
-
-Collapse
-
-Wrap
-
-Copy
 python SnakeRL.py
 Controls:
 Arrow Keys ⬆️⬇️⬅️➡️ – Move your snake.
@@ -91,13 +69,6 @@ Show that snake who’s boss! 👑
 2. AI Mode
 Sit back and let the neural network strut its stuff.
 
-bash
-
-Collapse
-
-Wrap
-
-Copy
 python SnakeNeuralAdvanced.py
 Watch the snake learn, dodge, and grow smarter.
 Press ESC to stop the show.
@@ -117,13 +88,7 @@ GPU lagging? Check if CUDA’s set up right with the test command above.
 Install Fails?
 Missing a library? Re-run pip install pygame numpy torch.
 Version clash? Use a virtual environment:
-bash
 
-Collapse
-
-Wrap
-
-Copy
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install pygame numpy torch
@@ -142,8 +107,10 @@ SnakeNN slithers under the MIT License—free to use, tweak, and share!
 
 Big thanks to:
 
+Javier Lora the creator of the breain.
+
 Pygame, NumPy, and PyTorch for powering this beast.
-The OG Snake game for sparking our nostalgia and inspiring this AI adventure! ❤️
+The OG Snake game for sparking our nostalgia, inspiring this AI adventure! ❤️
 Ready to slither into the future? Fire up SnakeNN and let the games begin! 🍎🐍
 
 Happy coding, playing, and AI-ing!
