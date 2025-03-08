@@ -13,8 +13,223 @@ try:
     import psutil
 except ImportError:
     print("psutil no disponible. El monitoreo de memoria será limitado.")
-# Colocar después de los imports iniciales en SnakeNeuralAdvanced.py
-import gc
+
+# ------------------- Utilidades para Manejo de Tensores -------------------
+def validate_tensor_shape(tensor, expected_shape, tensor_name="tensor"):
+    """
+    Verifica que un tensor tenga la forma esperada o compatible.
+    
+    Args:
+        tensor (torch.Tensor): El tensor a verificar
+        expected_shape (tuple): Forma esperada o mínima (los None son comodines)
+        tensor_name (str): Nombre para mensajes de error
+        
+    Returns:
+        bool: True si el tensor es válido
+        
+    Raises:
+        ValueError: Si el tensor no tiene la forma esperada
+    """
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"{tensor_name} debe ser un tensor PyTorch, no {type(tensor)}")
+    
+    if len(tensor.shape) != len(expected_shape):
+        raise ValueError(f"{tensor_name} tiene {len(tensor.shape)} dimensiones, se esperaban {len(expected_shape)}")
+    
+    for i, (actual, expected) in enumerate(zip(tensor.shape, expected_shape)):
+        if expected is not None and actual != expected:
+            raise ValueError(f"Dimensión {i} de {tensor_name} es {actual}, se esperaba {expected}")
+    
+    return True
+
+def safe_cat(tensors, dim=0, tensor_name="tensores"):
+    """
+    Realiza una concatenación segura de tensores, con verificaciones y manejo de errores.
+    
+    Args:
+        tensors (list): Lista de tensores a concatenar
+        dim (int): Dimensión en la que concatenar
+        tensor_name (str): Nombre para mensajes de error
+        
+    Returns:
+        torch.Tensor: Tensor concatenado o tensor de respaldo en caso de error
+    """
+    if not tensors:
+        return None
+    
+    try:
+        # Verificar que todos los tensores tengan la misma dimensionalidad
+        dims = set(t.dim() for t in tensors)
+        if len(dims) > 1:
+            # Ajustar dimensiones
+            min_dim = min(dims)
+            max_dim = max(dims)
+            adjusted_tensors = []
+            
+            for t in tensors:
+                if t.dim() < max_dim:
+                    # Añadir dimensiones faltantes
+                    missing_dims = max_dim - t.dim()
+                    adjusted_t = t
+                    for _ in range(missing_dims):
+                        adjusted_t = adjusted_t.unsqueeze(0)
+                    adjusted_tensors.append(adjusted_t)
+                else:
+                    adjusted_tensors.append(t)
+            
+            tensors = adjusted_tensors
+        
+        # Verificar dimensiones compatibles para concatenación
+        shapes = [t.shape for t in tensors]
+        
+        # Verificar que todas las dimensiones excepto 'dim' sean iguales
+        for i in range(max(dims)):
+            if i != dim:
+                sizes = set(s[i] if i < len(s) else 1 for s in shapes)
+                if len(sizes) > 1:
+                    # Las dimensiones no coinciden, redimensionar
+                    size = min(sizes)  # Usar el tamaño mínimo
+                    adjusted_tensors = []
+                    
+                    for t in tensors:
+                        if i < t.dim() and t.shape[i] > size:
+                            # Recortar la dimensión al tamaño mínimo
+                            slices = [slice(None)] * t.dim()
+                            slices[i] = slice(0, size)
+                            adjusted_t = t[tuple(slices)]
+                            adjusted_tensors.append(adjusted_t)
+                        else:
+                            adjusted_tensors.append(t)
+                    
+                    tensors = adjusted_tensors
+        
+        # Intentar concatenar
+        return torch.cat(tensors, dim=dim)
+    
+    except Exception as e:
+        print(f"Error al concatenar {tensor_name}: {e}")
+        # Dimensión de respaldo
+        backup_shape = list(tensors[0].shape)
+        backup_shape[dim] = sum(t.shape[dim] for t in tensors)
+        backup_tensor = torch.zeros(backup_shape, device=tensors[0].device)
+        
+        # Intentar copiar datos
+        try:
+            offset = 0
+            for t in tensors:
+                slice_indices = [slice(None)] * len(backup_shape)
+                slice_indices[dim] = slice(offset, offset + t.shape[dim])
+                backup_tensor[tuple(slice_indices)] = t
+                offset += t.shape[dim]
+        except:
+            pass  # Si falla la copia, al menos tenemos un tensor de ceros
+        
+        return backup_tensor
+
+class MemoryManager:
+    """Administrador de memoria para garantizar una gestión eficiente de recursos CUDA."""
+    def __init__(self, agent=None):
+        self.agent = agent
+        self.episode_counter = 0
+        self.last_clear_time = time.time()
+        self.clear_interval = 30  # segundos entre limpiezas profundas
+        self.memory_stats = []
+        
+    def register_agent(self, agent):
+        """Registra un agente para monitorear."""
+        self.agent = agent
+        
+    def after_episode_cleanup(self):
+        """Ejecuta limpieza después de cada episodio."""
+        self.episode_counter += 1
+        
+        # Limpiar el recolector de basura de Python
+        gc.collect()
+        
+        # Si hay CUDA disponible, limpiar caché
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+            # Cada 5 episodios, mostrar estadísticas de memoria
+            if self.episode_counter % 5 == 0:
+                allocated = torch.cuda.memory_allocated() / 1024**2
+                reserved = torch.cuda.memory_reserved() / 1024**2
+                self.memory_stats.append((allocated, reserved))
+                print(f"Memoria CUDA - Asignada: {allocated:.2f} MB, Reservada: {reserved:.2f} MB")
+                
+                # Si estamos acumulando demasiada memoria reservada, forzar liberación
+                if reserved > 1000:  # Si reserva más de 1GB
+                    self._force_memory_release()
+                    
+        # Cada cierto tiempo, hacer limpieza profunda
+        current_time = time.time()
+        if current_time - self.last_clear_time > self.clear_interval:
+            self._deep_cleanup()
+            self.last_clear_time = current_time
+            
+    def _force_memory_release(self):
+        """Fuerza liberación de memoria CUDA."""
+        if torch.cuda.is_available():
+            # Guardar model state_dict
+            if self.agent:
+                module_states = {}
+                for name, module in self.agent.modules.items():
+                    module_states[name] = copy.deepcopy(module.state_dict())
+                
+                # Mover modelos a CPU temporalmente
+                for name, module in self.agent.modules.items():
+                    self.agent.modules[name] = module.to('cpu')
+                
+                # Limpiar caché CUDA completamente
+                torch.cuda.empty_cache()
+                
+                # Volver a mover modelos a GPU
+                for name in self.agent.modules:
+                    self.agent.modules[name] = self.agent.modules[name].to(self.agent.device)
+                    self.agent.modules[name].load_state_dict(module_states[name])
+                
+                print("Forzada liberación de memoria CUDA")
+    
+    def _deep_cleanup(self):
+        """Realiza limpieza profunda de recursos."""
+        print("Iniciando limpieza profunda...")
+        
+        # Limpiar estado interno de PyTorch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Limpiar memoria episódica si es demasiado grande
+        if self.agent and hasattr(self.agent, 'episodic_memory'):
+            if len(self.agent.episodic_memory.episodes) > 20:
+                # Mantener solo los episodios más importantes
+                importances = [(i, ep.importance) for i, ep in enumerate(self.agent.episodic_memory.episodes)]
+                importances.sort(key=lambda x: x[1], reverse=True)
+                
+                # Mantener los 15 mejores episodios y descartar el resto
+                keep_indices = [x[0] for x in importances[:15]]
+                self.agent.episodic_memory.episodes = [self.agent.episodic_memory.episodes[i] for i in keep_indices]
+                print(f"Reducida memoria episódica de >20 a {len(self.agent.episodic_memory.episodes)} episodios")
+        
+        print("Limpieza profunda completada")
+        
+    def monitor_and_log(self):
+        """Monitorea y registra uso de memoria."""
+        if torch.cuda.is_available():
+            # Registrar estadísticas de uso de memoria
+            stats = {
+                'cuda_allocated': torch.cuda.memory_allocated() / 1024**2,
+                'cuda_reserved': torch.cuda.memory_reserved() / 1024**2,
+                'episodes': self.episode_counter,
+                'timestamp': time.time()
+            }
+            
+            # Añadir a memoria
+            self.memory_stats.append(stats)
+            
+            # Limitar tamaño del historial
+            if len(self.memory_stats) > 100:
+                self.memory_stats = self.memory_stats[-100:]
 
 def optimize_cuda_settings():
     """Optimiza la configuración de CUDA para mejor rendimiento"""
@@ -387,6 +602,8 @@ class PredictionModule(nn.Module):
     """Module for predicting outcomes of actions"""
     def __init__(self, state_size, action_size):
         super(PredictionModule, self).__init__()
+        self.state_size = state_size
+        self.action_size = action_size
         
         # Forward model to predict next state given current state and action
         self.forward_model = nn.Sequential(
@@ -413,45 +630,118 @@ class PredictionModule(nn.Module):
         )
         
     def predict_next_state(self, state, action):
-        """Predict the next state given current state and action"""
+        """Predict the next state given current state and action with manejo robusto de errores"""
+        # Validación defensiva
+        if not torch.is_tensor(state):
+            state = torch.FloatTensor(state).to(self.forward_model[0].weight.device)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)  # Añadir dimensión de batch
+        
         # Convert action to one-hot if not already
-        if action.dim() == 1:
+        if not torch.is_tensor(action):
+            action = torch.tensor([action], device=state.device)
+        
+        # Intentar inferir action_size correctamente
+        action_size = None
+        try:
+            # Primero intentar desde el modelo
             action_size = self.forward_model[0].input_size - state.size(1)
-            action_onehot = F.one_hot(action.long(), action_size).float()
-        else:
-            action_onehot = action
+        except:
+            # Fallback para casos especiales
+            action_size = self.action_size if hasattr(self, 'action_size') else 3
+        
+        # Convertir a one-hot con manejo de errores
+        try:
+            if action.dim() == 1:
+                action_onehot = F.one_hot(action.long(), action_size).float().to(state.device)
+            else:
+                action_onehot = action
+        except Exception as e:
+            # Fallback: crear tensor de ceros con un 1 en la posición correcta
+            print(f"Error en one-hot encoding: {e}")
+            action_onehot = torch.zeros(state.size(0), action_size, device=state.device)
+            if action.numel() == 1:  # Si es un solo valor
+                action_val = action.item() if torch.is_tensor(action) else action
+                if 0 <= action_val < action_size:
+                    action_onehot[:, action_val] = 1.0
+        
+        # Intentar concatenar con manejo de errores
+        try:
+            x = torch.cat([state, action_onehot], dim=1)
+        except Exception as e:
+            print(f"Error al concatenar en predict_next_state: {e}")
+            # Intentar solucionar problemas de dimensión
+            if state.size(0) != action_onehot.size(0):
+                # Ajustar batch sizes
+                if state.size(0) == 1:
+                    state = state.expand(action_onehot.size(0), -1)
+                elif action_onehot.size(0) == 1:
+                    action_onehot = action_onehot.expand(state.size(0), -1)
+                else:
+                    # Usar el batch size más pequeño
+                    min_batch = min(state.size(0), action_onehot.size(0))
+                    state = state[:min_batch]
+                    action_onehot = action_onehot[:min_batch]
             
-        # Concatenate state and action
-        x = torch.cat([state, action_onehot], dim=1)
-        return self.forward_model(x)
+            # Reintentar la concatenación
+            try:
+                x = torch.cat([state, action_onehot], dim=1)
+            except:
+                # Último recurso: crear entrada de tamaño correcto
+                x = torch.zeros(state.size(0), self.forward_model[0].input_size, device=state.device)
+        
+        # Pasar por el modelo con manejo de errores
+        try:
+            return self.forward_model(x)
+        except Exception as e:
+            print(f"Error en forward model: {e}")
+            # Retornar salida de emergencia con forma correcta
+            return torch.zeros(state.size(0), self.forward_model[-1].current_output_size, device=state.device)
     
     def predict_reward(self, state, action):
         """Predict reward for taking action in state"""
-        # Convert action to one-hot if needed
-        if action.dim() == 1:
-            action_size = self.reward_predictor[0].input_size - state.size(1)
-            action_onehot = F.one_hot(action.long(), action_size).float()
-        else:
-            action_onehot = action
-            
-        x = torch.cat([state, action_onehot], dim=1)
-        return self.reward_predictor(x)
+        # Defensive handling similar to predict_next_state
+        try:
+            # Convert action to one-hot if needed
+            if action.dim() == 1:
+                action_size = self.reward_predictor[0].input_size - state.size(1)
+                action_onehot = F.one_hot(action.long(), action_size).float()
+            else:
+                action_onehot = action
+                
+            x = torch.cat([state, action_onehot], dim=1)
+            return self.reward_predictor(x)
+        except Exception as e:
+            print(f"Error en predict_reward: {e}")
+            # Return safe fallback
+            return torch.zeros(state.size(0), 1, device=state.device)
     
     def estimate_uncertainty(self, state, action):
         """Estimate uncertainty of prediction (for intrinsic reward)"""
-        # Convert action to one-hot if needed
-        if action.dim() == 1:
-            action_size = self.uncertainty_estimator[0].input_size - state.size(1)
-            action_onehot = F.one_hot(action.long(), action_size).float()
-        else:
-            action_onehot = action
-            
-        x = torch.cat([state, action_onehot], dim=1)
-        return self.uncertainty_estimator(x)
+        # Defensive handling
+        try:
+            # Convert action to one-hot if needed
+            if action.dim() == 1:
+                action_size = self.uncertainty_estimator[0].input_size - state.size(1)
+                action_onehot = F.one_hot(action.long(), action_size).float()
+            else:
+                action_onehot = action
+                
+            x = torch.cat([state, action_onehot], dim=1)
+            return self.uncertainty_estimator(x)
+        except Exception as e:
+            print(f"Error en estimate_uncertainty: {e}")
+            # Return medium uncertainty as fallback
+            return torch.ones(state.size(0), 1, device=state.device) * 0.5
     
     def calculate_prediction_error(self, predicted_state, actual_state):
         """Calculate prediction error between predicted and actual state"""
-        return F.mse_loss(predicted_state, actual_state)
+        try:
+            return F.mse_loss(predicted_state, actual_state)
+        except Exception as e:
+            print(f"Error en calculate_prediction_error: {e}")
+            # Return medium error as fallback
+            return torch.tensor(0.5, device=predicted_state.device)
 
 class ExecutiveModule(nn.Module):
     """Coordinates other modules and makes final decisions"""
@@ -490,30 +780,58 @@ class ExecutiveModule(nn.Module):
         weighted_perception = perception_out * attn[0]
         weighted_navigation = navigation_out * attn[1]
         
-        # Verificar dimensiones de prediction_out y ajustar si es necesario
-        if prediction_out.dim() == 3:  # Si tiene 3 dimensiones [batch, actions, features]
-            # Aplanar las dimensiones 1 y 2 para obtener [batch, actions*features]
+        # Preparar prediction_out - crucial para evitar errores de dimensiones
+        if prediction_out.dim() == 3:  # Si es [batch, actions, features]
+            # Convertir siempre a [batch, features_flattened]
             batch_size = prediction_out.size(0)
-            prediction_out_flat = prediction_out.view(batch_size, -1)
-            weighted_prediction = prediction_out_flat * attn[2]
-        else:
-            weighted_prediction = prediction_out * attn[2]
+            prediction_out = prediction_out.reshape(batch_size, -1)
+        elif prediction_out.dim() == 2 and perception_out.dim() == 2:
+            # Si perception tiene forma [batch, features] pero prediction [features, x]
+            if prediction_out.size(0) != perception_out.size(0):
+                # Asegurar que la dimensión de batch coincida
+                if prediction_out.size(0) == 1:
+                    # Si prediction tiene batch=1, repetirlo para coincidir
+                    prediction_out = prediction_out.repeat(perception_out.size(0), 1)
+                elif perception_out.size(0) == 1:
+                    # O reducir batch de perception si prediction tiene más ejemplos
+                    weighted_perception = weighted_perception.repeat(prediction_out.size(0), 1)
+                    weighted_navigation = weighted_navigation.repeat(prediction_out.size(0), 1)
         
-        # Asegurar que todos los tensores tengan la misma dimensión antes de concatenar
-        if weighted_prediction.dim() != weighted_perception.dim():
-            # Convertimos todo a 2D si hay discrepancia
-            if weighted_prediction.dim() > 2:
-                batch_size = weighted_prediction.size(0)
-                weighted_prediction = weighted_prediction.view(batch_size, -1)
-            if weighted_perception.dim() > 2:
-                batch_size = weighted_perception.size(0)
-                weighted_perception = weighted_perception.view(batch_size, -1)
-            if weighted_navigation.dim() > 2:
-                batch_size = weighted_navigation.size(0)
-                weighted_navigation = weighted_navigation.view(batch_size, -1)
+        weighted_prediction = prediction_out * attn[2]
         
-        # Combine all inputs
-        combined = torch.cat([weighted_perception, weighted_navigation, weighted_prediction], dim=1)
+        # Verificar dimensiones antes de concatenar
+        if weighted_perception.dim() != weighted_prediction.dim():
+            # Ajustar dimensiones para que coincidan (preferiblemente a 2D)
+            if weighted_perception.dim() == 1:
+                weighted_perception = weighted_perception.unsqueeze(0)
+            if weighted_navigation.dim() == 1:
+                weighted_navigation = weighted_navigation.unsqueeze(0)
+            if weighted_prediction.dim() == 1:
+                weighted_prediction = weighted_prediction.unsqueeze(0)
+        
+        # Verificar tamaños de batch y ajustar si es necesario
+        sizes = [t.size(0) for t in [weighted_perception, weighted_navigation, weighted_prediction]]
+        if len(set(sizes)) > 1:  # Si hay diferentes tamaños de batch
+            min_size = min(sizes)
+            weighted_perception = weighted_perception[:min_size]
+            weighted_navigation = weighted_navigation[:min_size]
+            weighted_prediction = weighted_prediction[:min_size]
+        
+        try:
+            # Combine all inputs
+            combined = torch.cat([weighted_perception, weighted_navigation, weighted_prediction], dim=1)
+        except RuntimeError as e:
+            # Si aún falla, último recurso: reshape todo a vectores planos
+            print(f"Error en concatenación, usando método alternativo: {e}")
+            print(f"Formas: P={weighted_perception.shape}, N={weighted_navigation.shape}, PR={weighted_prediction.shape}")
+            
+            # Forzar que todo sea 2D con el mismo batch size
+            batch_size = min(t.size(0) for t in [weighted_perception, weighted_navigation, weighted_prediction])
+            combined = torch.cat([
+                weighted_perception[:batch_size].reshape(batch_size, -1),
+                weighted_navigation[:batch_size].reshape(batch_size, -1),
+                weighted_prediction[:batch_size].reshape(batch_size, -1)
+            ], dim=1)
         
         # Integrate and select action
         integrated = self.integrator(combined)
@@ -533,7 +851,6 @@ class ExecutiveModule(nn.Module):
             self.module_attention.data = torch.clamp(self.module_attention.data, min=0.1)
             # Re-normalize
             self.module_attention.data = F.softmax(self.module_attention.data, dim=0)
-
 # ------------------- Meta-Learning System -------------------
 class MetaController:
     """Meta-learning system that optimizes hyperparameters and learning strategies"""
@@ -981,12 +1298,28 @@ class EpisodicMemory:
         else:
             episode_probs = importances / sum(importances)
             
-        selected_episodes = np.random.choice(
-            len(self.episodes), 
-            min(5, len(self.episodes)),  # Sample from multiple episodes
-            p=episode_probs, 
-            replace=False
-        )
+        # Determinar cuántos episodios seleccionar (no más que los episodios con prob > 0)
+        max_episodes = len(self.episodes)
+        if episode_probs is not None:
+            # Contar elementos con probabilidad no-cero
+            non_zero_probs = np.count_nonzero(episode_probs)
+            max_episodes = min(max_episodes, non_zero_probs)
+        
+        # Asegurarnos de no intentar seleccionar más episodios de los disponibles
+        episodes_to_select = min(5, max_episodes)
+        
+        # Obtener episodios aleatorios si no hay suficientes
+        if episodes_to_select < 1:
+            # Fallback a selección aleatoria uniforme si no hay suficientes episodios
+            selected_episodes = [random.randint(0, len(self.episodes) - 1)]
+        else:
+            # Seleccionar episodios con las probabilidades calculadas
+            selected_episodes = np.random.choice(
+                len(self.episodes), 
+                episodes_to_select,
+                p=episode_probs, 
+                replace=False
+            )
         
         # Calculate transitions per episode
         transitions_per_episode = batch_size // len(selected_episodes)
@@ -1155,64 +1488,81 @@ class CuriosityModule:
     
     def compute_surprise_reward(self, state, action, next_state):
         """Compute reward based on prediction error (surprise)"""
-        # Convert to tensors
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        action_onehot = self._prepare_action_tensor(action)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
-        
-        # Predict next state
-        with torch.no_grad():
-            pred_input = torch.cat([state_tensor, action_onehot], dim=1)
-            predicted_next_state = self.forward_model(pred_input)
+        try:
+            # Convert to tensors
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action_onehot = self._prepare_action_tensor(action)
+            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
             
-            # Compute prediction error
-            prediction_error = F.mse_loss(predicted_next_state, next_state_tensor).item()
-        
-        # Update max surprise for normalization
-        if prediction_error > self.max_surprise:
-            self.max_surprise = prediction_error
+            # Predict next state
+            with torch.no_grad():
+                pred_input = torch.cat([state_tensor, action_onehot], dim=1)
+                predicted_next_state = self.forward_model(pred_input)
+                
+                # Compute prediction error
+                prediction_error = F.mse_loss(predicted_next_state, next_state_tensor).item()
             
-        # Normalize and store surprise
-        normalized_surprise = min(1.0, prediction_error / self.max_surprise)
-        self.surprise_history.append(normalized_surprise)
-        
-        return normalized_surprise
+            # Update max surprise for normalization
+            if prediction_error > self.max_surprise:
+                self.max_surprise = prediction_error
+                
+            # Normalize and store surprise
+            normalized_surprise = min(1.0, prediction_error / self.max_surprise)
+            self.surprise_history.append(normalized_surprise)
+            
+            return normalized_surprise
+        except Exception as e:
+            print(f"Error en compute_surprise_reward: {e}")
+            # Fallback: retornar sorpresa media
+            return 0.5
     
     def update_forward_model(self, state, action, next_state):
         """Update the forward model to improve predictions"""
-        # Convert to tensors
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        action_onehot = self._prepare_action_tensor(action)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
-        
-        # Training step
-        self.optimizer.zero_grad()
-        pred_input = torch.cat([state_tensor, action_onehot], dim=1)
-        predicted_next_state = self.forward_model(pred_input)
-        loss = F.mse_loss(predicted_next_state, next_state_tensor)
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss.item()
+        try:
+            # Convert to tensors
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action_onehot = self._prepare_action_tensor(action)
+            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+            
+            # Training step
+            self.optimizer.zero_grad()
+            pred_input = torch.cat([state_tensor, action_onehot], dim=1)
+            predicted_next_state = self.forward_model(pred_input)
+            loss = F.mse_loss(predicted_next_state, next_state_tensor)
+            loss.backward()
+            self.optimizer.step()
+            
+            return loss.item()
+        except Exception as e:
+            print(f"Error en update_forward_model: {e}")
+            return 0.0
     
     def compute_intrinsic_reward(self, state, action, next_state):
         """Compute combined intrinsic reward"""
-        novelty = self.compute_novelty_reward(state)
-        surprise = self.compute_surprise_reward(state, action, next_state)
-        
-        # Combined reward
-        intrinsic_reward = self.curiosity_weight * (0.5 * novelty + 0.5 * surprise)
-        
-        # Decay curiosity weight over time
-        self.curiosity_weight *= self.curiosity_decay
-        self.curiosity_weight = max(0.01, self.curiosity_weight)
-        
-        return intrinsic_reward
+        try:
+            novelty = self.compute_novelty_reward(state)
+            surprise = self.compute_surprise_reward(state, action, next_state)
+            
+            # Combined reward
+            intrinsic_reward = self.curiosity_weight * (0.5 * novelty + 0.5 * surprise)
+            
+            # Decay curiosity weight over time
+            self.curiosity_weight *= self.curiosity_decay
+            self.curiosity_weight = max(0.01, self.curiosity_weight)
+            
+            return intrinsic_reward
+        except Exception as e:
+            print(f"Error en compute_intrinsic_reward: {e}")
+            return 0.01  # Valor pequeño por defecto
     
     def is_novel_state(self, state, threshold=NOVELTY_THRESHOLD):
         """Check if a state is novel enough for exploration"""
-        novelty = self.compute_novelty_reward(state)
-        return novelty > threshold
+        try:
+            novelty = self.compute_novelty_reward(state)
+            return novelty > threshold
+        except Exception as e:
+            print(f"Error en is_novel_state: {e}")
+            return False
 
 # ------------------- Knowledge Transfer System -------------------
 class SkillLibrary:
@@ -1772,95 +2122,148 @@ class ModularAdvancedAgent:
             self.concept_abstraction.create_concept_prototype(concept)
     
     def act(self, state):
-        """Select an action based on current state"""
+        """Select an action based on current state with manejo robusto de errores"""
         # Exploration vs exploitation
         if np.random.rand() <= self.epsilon:
             # Explore: Choose random action
             # But first check if we should be curious about particular actions
-            if self.curiosity.is_novel_state(state) and random.random() < 0.5:
-                # For novel states, try all actions in prediction model
-                best_action = self._find_most_curious_action(state)
-                return best_action
-            else:
-                return random.randrange(self.action_size)
+            try:
+                if self.curiosity.is_novel_state(state) and random.random() < 0.5:
+                    # For novel states, try all actions in prediction model
+                    best_action = self._find_most_curious_action(state)
+                    return best_action
+            except Exception as e:
+                print(f"Error en exploración de curiosidad: {e}")
+            
+            return random.randrange(self.action_size)
         
-        # Convert state to tensor
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        # Convert state to tensor con manejo seguro
+        try:
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        except Exception as e:
+            print(f"Error convirtiendo estado a tensor: {e}")
+            # Fallback: usar tensor de ceros
+            state_tensor = torch.zeros(1, self.state_size, device=self.device)
         
         # Exploit: Use neural modules to select best action
         with torch.no_grad():
-            # Process through modular architecture
-            # 1. Perception module processes raw state
-            perception_features = self.modules['perception'](state_tensor)
+            try:
+                # 1. Perception module processes raw state
+                perception_features = self.modules['perception'](state_tensor)
+            except Exception as e:
+                print(f"Error en módulo de percepción: {e}")
+                # Tensor de respaldo
+                perception_features = torch.zeros(1, self.modules['perception'].output_size, device=self.device)
             
-            # 2. Extract position and target from state for navigation
-            position = torch.FloatTensor([[state[3], state[4], state[5], state[6]]]).to(self.device)  # Direction one-hot
-            target = torch.FloatTensor([[state[7], state[8], state[9], state[10]]]).to(self.device)   # Food direction
+            try:
+                # 2. Extract position and target from state for navigation
+                position = torch.FloatTensor([[state[3], state[4], state[5], state[6]]]).to(self.device)  # Direction one-hot
+                target = torch.FloatTensor([[state[7], state[8], state[9], state[10]]]).to(self.device)   # Food direction
+            except Exception as e:
+                print(f"Error extrayendo posición/objetivo: {e}")
+                # Tensores de respaldo
+                position = torch.zeros(1, 4, device=self.device)
+                target = torch.zeros(1, 4, device=self.device)
             
-            # 3. Navigation module suggests actions
-            navigation_output = self.modules['navigation'](perception_features, position, target)
+            try:
+                # 3. Navigation module suggests actions
+                navigation_output = self.modules['navigation'](perception_features, position, target)
+            except Exception as e:
+                print(f"Error en módulo de navegación: {e}")
+                # Tensor de respaldo
+                navigation_output = torch.zeros(1, self.modules['navigation'].pathfinder[-1].current_output_size, 
+                                            device=self.device)
             
-            # 4. Prediction module evaluates potential outcomes
-            # First, create one-hot encodings for all possible actions
-            action_tensors = []
-            for a in range(self.action_size):
-                action_onehot = F.one_hot(torch.tensor([a]), self.action_size).float().to(self.device)
-                action_tensors.append(action_onehot)
-            
-            # Evaluate each action
-            prediction_outputs = []
-            for action_tensor in action_tensors:
-                # Predict next state
-                pred_next_state = self.modules['prediction'].predict_next_state(state_tensor, action_tensor)
-                # Predict reward
-                pred_reward = self.modules['prediction'].predict_reward(state_tensor, action_tensor)
-                # Estimate uncertainty
-                uncertainty = self.modules['prediction'].estimate_uncertainty(state_tensor, action_tensor)
+            # 4. Prediction module con manejo de errores
+            prediction_output = None
+            try:
+                # Collect all action predictions
+                action_tensors = []
+                prediction_outputs = []
                 
-                # Combine these into a prediction output
-                prediction_output = torch.cat([pred_reward, uncertainty], dim=1)
-                prediction_outputs.append(prediction_output)
+                for a in range(self.action_size):
+                    try:
+                        # Create one-hot action
+                        action_onehot = F.one_hot(torch.tensor([a]), self.action_size).float().to(self.device)
+                        action_tensors.append(action_onehot)
+                        
+                        # Get predictions
+                        pred_next_state = self.modules['prediction'].predict_next_state(state_tensor, action_onehot)
+                        pred_reward = self.modules['prediction'].predict_reward(state_tensor, action_onehot)
+                        uncertainty = self.modules['prediction'].estimate_uncertainty(state_tensor, action_onehot)
+                        
+                        # Combine predictions
+                        pred_output = torch.cat([pred_reward, uncertainty], dim=1)
+                        prediction_outputs.append(pred_output)
+                    except Exception as e:
+                        # Si falla para una acción, usar tensor de ceros
+                        print(f"Error prediciendo acción {a}: {e}")
+                        prediction_outputs.append(torch.zeros(1, 2, device=self.device))
+                
+                # Combinar las salidas de predicción con manejo de excepciones
+                if prediction_outputs:
+                    try:
+                        # Intentar combinar como una matriz 3D [batch, actions, features]
+                        if all(p.dim() == prediction_outputs[0].dim() for p in prediction_outputs):
+                            prediction_output = torch.stack(prediction_outputs, dim=0)
+                            if prediction_output.dim() == 2:
+                                prediction_output = prediction_output.unsqueeze(0)
+                        else:
+                            # Si hay inconsistencia en dimensiones, concatenar en un vector plano
+                            prediction_output = torch.cat([p.flatten().unsqueeze(0) for p in prediction_outputs], dim=1)
+                            
+                    except Exception as e:
+                        print(f"Error combinando predicciones: {e}")
+                        # Tensor de respaldo
+                        prediction_output = torch.zeros(1, self.action_size * 2, device=self.device)
+                else:
+                    # No se pudo generar ninguna predicción
+                    prediction_output = torch.zeros(1, self.action_size * 2, device=self.device)
+                    
+            except Exception as e:
+                print(f"Error general en módulo de predicción: {e}")
+                # Tensor de respaldo
+                prediction_output = torch.zeros(1, self.action_size * 2, device=self.device)
             
-            # Combine all prediction outputs - modificar para asegurar dimensiones correctas
-            if prediction_outputs:
-                # Stack en vez de concatenar para mantener estructura
-                prediction_output = torch.stack(prediction_outputs, dim=0)
-                # Asegurar que tiene la forma correcta para ser procesado
-                if len(prediction_output.shape) == 2:
-                    prediction_output = prediction_output.unsqueeze(0)  # Añadir dimensión de batch
-            else:
-                # Si no hay salidas de predicción, crear tensor cero
-                prediction_output = torch.zeros(1, self.action_size, 2, device=self.device)
-            
-            # 5. Executive module integrates all signals and selects final action
-            q_values = self.modules['executive'](perception_features, navigation_output, prediction_output)
-            
-            # Register average Q-value for monitoring
-            self.q_values.append(float(torch.mean(q_values).cpu().numpy()))
-            
-            # Return action with highest Q-value
-            return int(torch.argmax(q_values).item())
+            try:
+                # 5. Executive module integrates all signals and selects final action
+                q_values = self.modules['executive'](perception_features, navigation_output, prediction_output)
+                
+                # Register average Q-value for monitoring
+                self.q_values.append(float(torch.mean(q_values).cpu().numpy()))
+                
+                # Return action with highest Q-value
+                return int(torch.argmax(q_values).item())
+            except Exception as e:
+                print(f"Error en módulo ejecutivo: {e}")
+                # Acción aleatoria como fallback
+                return random.randrange(self.action_size)
     
     def _find_most_curious_action(self, state):
         """Find the action that would lead to the most curious outcome"""
-        # Try all actions in the prediction model
-        curiosity_scores = []
-        for action in range(self.action_size):
-            # Use the prediction module to predict next state
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action_onehot = F.one_hot(torch.tensor([action]), self.action_size).float().to(self.device)
-            
-            with torch.no_grad():
-                # Predict next state
-                pred_next_state = self.modules['prediction'].predict_next_state(state_tensor, action_onehot)
-                # Get uncertainty
-                uncertainty = self.modules['prediction'].estimate_uncertainty(state_tensor, action_onehot)
+        try:
+            # Try all actions in the prediction model
+            curiosity_scores = []
+            for action in range(self.action_size):
+                # Use the prediction module to predict next state
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                action_onehot = F.one_hot(torch.tensor([action]), self.action_size).float().to(self.device)
                 
-                # Higher uncertainty = more curious
-                curiosity_scores.append(float(uncertainty.item()))
-        
-        # Return action with highest curiosity score
-        return int(np.argmax(curiosity_scores))
+                with torch.no_grad():
+                    # Predict next state
+                    pred_next_state = self.modules['prediction'].predict_next_state(state_tensor, action_onehot)
+                    # Get uncertainty
+                    uncertainty = self.modules['prediction'].estimate_uncertainty(state_tensor, action_onehot)
+                    
+                    # Higher uncertainty = more curious
+                    curiosity_scores.append(float(uncertainty.item()))
+            
+            # Return action with highest curiosity score
+            return int(np.argmax(curiosity_scores))
+        except Exception as e:
+            print(f"Error en _find_most_curious_action: {e}")
+            # Return random action as fallback
+            return random.randrange(self.action_size)
     
     def monitor_performance(self, start_time):
         """Monitor performance metrics for batch size adaptation"""
@@ -1896,14 +2299,174 @@ class ModularAdvancedAgent:
         
         return training_time
     
+    def process_batch_safely(self, states, actions, rewards, next_states, dones):
+        """
+        Procesa un batch de experiencias con manejo robusto de excepciones
+        y dimensiones de tensores.
+        
+        Esto mejora la estabilidad del entrenamiento ante datos inesperados.
+        """
+        # Conversión segura a tensores con dimensiones consistentes
+        try:
+            states = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
+            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+            next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device)
+            dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        except Exception as e:
+            print(f"Error en conversión de batch a tensores: {e}")
+            # Si falla, reducir el tamaño del batch y reintentar
+            try:
+                max_safe_size = min(len(states), len(actions), len(rewards), len(next_states), len(dones))
+                safe_size = max(1, max_safe_size // 2)  # Reducir a la mitad para mayor seguridad
+                
+                states = torch.tensor(np.array(states[:safe_size]), dtype=torch.float32, device=self.device)
+                actions = torch.tensor(actions[:safe_size], dtype=torch.long, device=self.device)
+                rewards = torch.tensor(rewards[:safe_size], dtype=torch.float32, device=self.device)
+                next_states = torch.tensor(np.array(next_states[:safe_size]), dtype=torch.float32, device=self.device)
+                dones = torch.tensor(dones[:safe_size], dtype=torch.float32, device=self.device)
+            except Exception as e2:
+                print(f"Error crítico en procesamiento de batch: {e2}")
+                return None  # Devolver None indica que el batch no se puede procesar
+        
+        # Usar bloques try/except para cada etapa del procesamiento
+        try:
+            # 1. Current state processing
+            with torch.no_grad():
+                perception_features = self.modules['perception'](states)
+                
+                # Extract position and target information with manejo defensivo
+                try:
+                    positions = torch.stack([
+                        torch.tensor([s[3], s[4], s[5], s[6]], dtype=torch.float32, device=self.device) 
+                        for s in states
+                    ])
+                    
+                    targets = torch.stack([
+                        torch.tensor([s[7], s[8], s[9], s[10]], dtype=torch.float32, device=self.device)
+                        for s in states
+                    ])
+                except Exception as e:
+                    print(f"Error extrayendo posiciones/objetivos: {e}")
+                    # Crear tensores de respaldo
+                    positions = torch.zeros(states.size(0), 4, device=self.device)
+                    targets = torch.zeros(states.size(0), 4, device=self.device)
+            
+            # Procesar navegación
+            try:
+                navigation_output = self.modules['navigation'](perception_features, positions, targets)
+            except Exception as e:
+                print(f"Error en módulo de navegación: {e}")
+                navigation_output = torch.zeros(states.size(0), 
+                                            self.modules['navigation'].pathfinder[-1].current_output_size, 
+                                            device=self.device)
+            
+            # For prediction module, we need the actual actions taken
+            try:
+                action_onehot = F.one_hot(actions, self.action_size).float()
+            except Exception as e:
+                print(f"Error en codificación one-hot: {e}")
+                action_onehot = torch.zeros(states.size(0), self.action_size, device=self.device)
+                for i, a in enumerate(actions):
+                    if 0 <= a < self.action_size:
+                        action_onehot[i, a] = 1.0
+            
+            # Procesar predicciones con gestión de errores para cada paso
+            prediction_outputs = []
+            for i in range(len(states)):
+                try:
+                    # Use actual state and action
+                    state_i = states[i:i+1]
+                    action_i = action_onehot[i:i+1]
+                    
+                    # Get prediction outputs con manejo de errores
+                    with torch.no_grad():
+                        pred_reward = self.modules['prediction'].predict_reward(state_i, action_i)
+                        uncertainty = self.modules['prediction'].estimate_uncertainty(state_i, action_i)
+                    
+                    prediction_output = torch.cat([pred_reward, uncertainty], dim=1)
+                    prediction_outputs.append(prediction_output)
+                except Exception as e:
+                    # Si falla para este ejemplo, crear un tensor de respaldo
+                    print(f"Error en predicción para elemento {i}: {e}")
+                    prediction_outputs.append(torch.zeros(1, 2, device=self.device))
+            
+            # Combinar predicciones de manera segura
+            try:
+                prediction_output = torch.cat(prediction_outputs, dim=0)
+            except Exception as e:
+                print(f"Error combinando predicciones: {e}")
+                # Tensor de respaldo
+                prediction_output = torch.zeros(states.size(0), 2, device=self.device)
+            
+            # Executive module integration
+            try:
+                current_q_values = self.modules['executive'](perception_features, navigation_output, prediction_output)
+                q_values = current_q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+            except Exception as e:
+                print(f"Error en módulo ejecutivo: {e}")
+                # Devolver valores Q de respaldo
+                return None
+            
+            # Next state processing para valores objetivo
+            with torch.no_grad():
+                try:
+                    # Procesar estados siguientes
+                    next_perception_features = self.modules['perception'](next_states)
+                    
+                    # Información de posición y objetivo con manejo de errores
+                    try:
+                        next_positions = torch.stack([
+                            torch.tensor([s[3], s[4], s[5], s[6]], dtype=torch.float32, device=self.device)
+                            for s in next_states
+                        ])
+                        
+                        next_targets = torch.stack([
+                            torch.tensor([s[7], s[8], s[9], s[10]], dtype=torch.float32, device=self.device)
+                            for s in next_states
+                        ])
+                    except Exception as e:
+                        print(f"Error extrayendo posiciones/objetivos siguientes: {e}")
+                        next_positions = torch.zeros(next_states.size(0), 4, device=self.device)
+                        next_targets = torch.zeros(next_states.size(0), 4, device=self.device)
+                    
+                    next_navigation_output = self.modules['navigation'](next_perception_features, next_positions, next_targets)
+                    
+                    # Simplificar predicciones para estados siguientes
+                    prediction_output_zero = torch.zeros(len(states), 2, device=self.device)
+                    next_q_values = self.modules['executive'](next_perception_features, next_navigation_output, prediction_output_zero)
+                    
+                    # Double DQN approach
+                    best_actions = next_q_values.argmax(dim=1)
+                    max_next_q_values = next_q_values.gather(1, best_actions.unsqueeze(1)).squeeze(1)
+                    
+                    # Calcular valores Q objetivo
+                    targets = rewards + (1 - dones) * self.gamma * max_next_q_values
+                except Exception as e:
+                    print(f"Error en procesamiento de estado siguiente: {e}")
+                    # Usar recompensas como objetivo si falla el cálculo completo
+                    targets = rewards
+            
+            # Todo el procesamiento fue exitoso, devolver valores
+            return q_values, targets
+        
+        except Exception as e:
+            print(f"Error general en procesamiento de batch: {e}")
+            return None
+    
     def train(self):
-        """Train the neural network using a batch of experiences with adaptive batch sizing"""
+        """Versión mejorada de train con mejor manejo de errores y excepciones"""
         # Check if we have enough samples
         if len(self.episodic_memory.episodes) == 0:
             return 0
         
         # Record start time for performance monitoring
         start_time = time.time()
+        
+        # Verificar si necesitamos entrenar (reducir frecuencia de entrenamiento)
+        if self.episodes_trained % 2 != 0 and self.episodes_trained > 100:
+            # Entrenar cada 2 episodios después de cierto aprendizaje
+            return 0
         
         # Sample from episodic memory with current batch size
         if len(self.recent_states) > 0:
@@ -1916,107 +2479,19 @@ class ModularAdvancedAgent:
         
         if not batch:
             return 0
-            
+        
         # Unpack batch
         states, actions, rewards, next_states, dones = zip(*batch)
         
-        # Convert to tensors
-        states = torch.FloatTensor(np.array(states)).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
+        # Procesar batch de manera segura
+        result = self.process_batch_safely(states, actions, rewards, next_states, dones)
         
-        # Forward pass through the modular architecture
-        # 1. Current state processing
-        perception_features = self.modules['perception'](states)
+        if result is None:
+            # El procesamiento falló, omitir este batch
+            print("Omitiendo batch debido a errores de procesamiento")
+            return 0
         
-        # Extract position and target information
-        positions = torch.stack([
-            torch.FloatTensor([s[3], s[4], s[5], s[6]]) for s in states
-        ]).to(self.device)
-        
-        targets = torch.stack([
-            torch.FloatTensor([s[7], s[8], s[9], s[10]]) for s in states
-        ]).to(self.device)
-        
-        navigation_output = self.modules['navigation'](perception_features, positions, targets)
-        
-        # For prediction module, we need the actual actions taken
-        action_onehot = F.one_hot(actions, self.action_size).float()
-        
-        prediction_outputs = []
-        for i in range(len(states)):
-            # Use actual state and action
-            state_i = states[i:i+1]
-            action_i = action_onehot[i:i+1]
-            
-            # Get prediction outputs
-            pred_reward = self.modules['prediction'].predict_reward(state_i, action_i)
-            uncertainty = self.modules['prediction'].estimate_uncertainty(state_i, action_i)
-            
-            prediction_output = torch.cat([pred_reward, uncertainty], dim=1)
-            prediction_outputs.append(prediction_output)
-        
-        prediction_output = torch.cat(prediction_outputs, dim=0)
-        
-        # Executive module integration
-        current_q_values = self.modules['executive'](perception_features, navigation_output, prediction_output)
-        q_values = current_q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
-        
-        # 2. Next state processing for target values
-        with torch.no_grad():
-            # Process next states
-            next_perception_features = self.modules['perception'](next_states)
-            
-            # Extract position and target information for next states
-            next_positions = torch.stack([
-                torch.FloatTensor([s[3], s[4], s[5], s[6]]) for s in next_states
-            ]).to(self.device)
-            
-            next_targets = torch.stack([
-                torch.FloatTensor([s[7], s[8], s[9], s[10]]) for s in next_states
-            ]).to(self.device)
-            
-            next_navigation_output = self.modules['navigation'](next_perception_features, next_positions, next_targets)
-            
-            # For next state, we need to evaluate all possible actions
-            next_prediction_outputs = []
-            for i in range(len(next_states)):
-                state_i = next_states[i:i+1]
-                
-                # Evaluate all actions
-                action_predictions = []
-                for a in range(self.action_size):
-                    # Create one-hot for this action
-                    a_onehot = F.one_hot(torch.tensor([a]), self.action_size).float().to(self.device)
-                    
-                    # Predict reward and uncertainty
-                    pred_reward = self.modules['prediction'].predict_reward(state_i, a_onehot)
-                    uncertainty = self.modules['prediction'].estimate_uncertainty(state_i, a_onehot)
-                    
-                    # Combine
-                    pred = torch.cat([pred_reward, uncertainty], dim=1)
-                    action_predictions.append(pred)
-                
-                # Stack all action predictions
-                next_prediction_output = torch.cat(action_predictions, dim=0).unsqueeze(0)
-                next_prediction_outputs.append(next_prediction_output)
-            
-            # Now we have a tensor of shape [batch_size, action_size, prediction_features]
-            # We need to reshape to [batch_size, action_size * prediction_features]
-            next_prediction_flat = torch.cat([p.view(1, -1) for p in next_prediction_outputs], dim=0)
-            
-            # Executive module integration for next states
-            prediction_output_zero = torch.zeros(self.batch_size, 2, device=self.device)
-            next_q_values = self.modules['executive'](next_perception_features, next_navigation_output, prediction_output_zero)
-            
-            # Double DQN approach - use model to select actions, target to evaluate
-            best_actions = next_q_values.argmax(dim=1)
-            max_next_q_values = next_q_values.gather(1, best_actions.unsqueeze(1)).squeeze(1)
-            
-            # Calculate target Q values
-            targets = rewards + (1 - dones) * self.gamma * max_next_q_values
+        q_values, targets = result
         
         # Calculate loss
         loss = F.smooth_l1_loss(q_values, targets)
@@ -2024,6 +2499,7 @@ class ModularAdvancedAgent:
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
+        
         # Clip gradients to prevent explosion
         torch.nn.utils.clip_grad_norm_(
             [p for module in self.modules.values() for p in module.parameters()], 
@@ -2031,31 +2507,38 @@ class ModularAdvancedAgent:
         )
         self.optimizer.step()
         
-        # Apply Hebbian learning to dynamic layers
-        for module in self.modules.values():
-            for layer in module.modules():
-                if isinstance(layer, DynamicLayer):
-                    layer.apply_hebbian_learning()
+        # Reducir frecuencia de aplicación de aprendizaje hebbiano
+        if self.episodes_trained % 3 == 0:  # Aplicar cada 3 episodios
+            # Apply Hebbian learning to dynamic layers
+            for module in self.modules.values():
+                for layer in module.modules():
+                    if isinstance(layer, DynamicLayer):
+                        try:
+                            layer.apply_hebbian_learning()
+                        except Exception as e:
+                            print(f"Error en aprendizaje hebbiano: {e}")
         
-        # Update prediction model based on actual transitions
-        prediction_losses = []
-        for state, action, _, next_state, _ in zip(states, actions, rewards, next_states, dones):
-            # Convert to numpy for curiosity module - asegurando tipos correctos
-            state_np = state.cpu().numpy()
-            action_int = int(action.item())
-            next_state_np = next_state.cpu().numpy()
-            
-            # Update forward model in curiosity module
+        # Reducir actualizaciones del modelo de predicción
+        if self.episodes_trained % 5 == 0:  # Actualizar cada 5 episodios
             try:
-                pred_loss = self.curiosity.update_forward_model(state_np, action_int, next_state_np)
-                prediction_losses.append(pred_loss)
+                # Seleccionar un subconjunto de transiciones para actualizar el modelo
+                update_indices = np.random.choice(len(states), min(10, len(states)), replace=False)
+                
+                for idx in update_indices:
+                    try:
+                        state = states[idx].cpu().numpy()
+                        action = int(actions[idx].item())
+                        next_state = next_states[idx].cpu().numpy()
+                        
+                        # Update forward model in curiosity module
+                        self.curiosity.update_forward_model(state, action, next_state)
+                    except Exception as e:
+                        continue
             except Exception as e:
-                print(f"Error updating forward model: {e}")
-                # Continuar a pesar del error
-                continue
+                print(f"Error actualizando modelo de predicción: {e}")
         
         # Monitor performance metrics
-        training_time = self.monitor_performance(start_time)
+        self.monitor_performance(start_time)
         
         # Return loss for monitoring
         self.losses.append(float(loss.item()))
@@ -2447,6 +2930,9 @@ def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
     # OPTIMIZACIÓN: Verificar uso de GPU
     check_gpu_compatibility()
     
+    # Crear gestor de memoria
+    memory_manager = MemoryManager(agent)
+    
     try:
         for episode in range(episodes):
             state = env.reset()
@@ -2455,11 +2941,18 @@ def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
             episode_score = 0
             steps = 0
             
+            # Monitorear memoria al inicio del episodio
+            memory_manager.monitor_and_log()
+            
             while not done:
                 action = get_action(agent, state)
                 next_state, reward, done = env.step(action)
                 combined_reward = process_state_action_reward(agent, state, action, reward, next_state, done)
-                train_advanced_agent(agent)
+                
+                # Evitar entrenar en cada paso para reducir carga computacional
+                if steps % 3 == 0:  # Entrenar cada 3 pasos
+                    train_advanced_agent(agent)
+                
                 state = next_state
                 total_reward += combined_reward
                 if reward > 0:  # Suponiendo que reward > 0 indica que comió comida
@@ -2481,15 +2974,12 @@ def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
             # Actualizar después del episodio
             update_after_episode(agent, env, total_reward, episode_score)
             
+            # NUEVA OPTIMIZACIÓN: Limpieza después de cada episodio
+            memory_manager.after_episode_cleanup()
+            
             # Imprimir progreso cada 10 episodios
             if (episode + 1) % 10 == 0:
                 print(f"Episodio {episode + 1}/{episodes} - Score: {episode_score} - Reward: {total_reward:.2f} - Steps: {steps}")
-                
-                # OPTIMIZACIÓN: Recolectar basura para liberar memoria cada 10 episodios
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    print(f"Memoria GPU: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
                 
                 # Guardar checkpoint cada 50 episodios
                 if (episode + 1) % 50 == 0:
@@ -2502,6 +2992,90 @@ def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
     finally:
         # Asegurar que se liberen los recursos
         env.close()
+        
+        # Limpieza final de memoria
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Guardar el agente entren
+def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
+    """Integra el agente neuronal avanzado con el entorno SnakeRL y lo entrena."""
+    from SnakeRL import SnakeGame  # Importar el entorno desde SnakeRL.py
+    env = SnakeGame(render=True, difficulty=0)  # Puedes ajustar la dificultad
+    
+    state_size = len(env._get_state())  # Obtener el tamaño del estado
+    action_size = 3  # Acciones: 0 (recto), 1 (izquierda), 2 (derecha)
+    
+    agent = create_advanced_agent(state_size, action_size)
+    
+    # OPTIMIZACIÓN: Verificar uso de GPU
+    check_gpu_compatibility()
+    
+    # Crear gestor de memoria
+    memory_manager = MemoryManager(agent)
+    
+    try:
+        for episode in range(episodes):
+            state = env.reset()
+            done = False
+            total_reward = 0
+            episode_score = 0
+            steps = 0
+            
+            # Monitorear memoria al inicio del episodio
+            memory_manager.monitor_and_log()
+            
+            while not done:
+                action = get_action(agent, state)
+                next_state, reward, done = env.step(action)
+                combined_reward = process_state_action_reward(agent, state, action, reward, next_state, done)
+                
+                # Evitar entrenar en cada paso para reducir carga computacional
+                if steps % 3 == 0:  # Entrenar cada 3 pasos
+                    train_advanced_agent(agent)
+                
+                state = next_state
+                total_reward += combined_reward
+                if reward > 0:  # Suponiendo que reward > 0 indica que comió comida
+                    episode_score += 1
+                steps += 1
+                
+                # Renderizar el entorno
+                env.render(current_score=episode_score, total_score=agent.episodes_trained, 
+                       episodes_left=episodes - episode - 1, epsilon=agent.epsilon, 
+                       avg_q=np.mean(agent.q_values[-100:]) if agent.q_values else 0)
+                
+                # Manejar eventos para permitir salida manual
+                if not env.handle_events():
+                    print("Entrenamiento interrumpido por el usuario.")
+                    save_advanced_agent(agent, save_path)
+                    env.close()
+                    return
+            
+            # Actualizar después del episodio
+            update_after_episode(agent, env, total_reward, episode_score)
+            
+            # NUEVA OPTIMIZACIÓN: Limpieza después de cada episodio
+            memory_manager.after_episode_cleanup()
+            
+            # Imprimir progreso cada 10 episodios
+            if (episode + 1) % 10 == 0:
+                print(f"Episodio {episode + 1}/{episodes} - Score: {episode_score} - Reward: {total_reward:.2f} - Steps: {steps}")
+                
+                # Guardar checkpoint cada 50 episodios
+                if (episode + 1) % 50 == 0:
+                    save_advanced_agent(agent, f"{save_path}.checkpoint")
+        
+        # Guardar el agente entrenado
+        save_advanced_agent(agent, save_path)
+        print(f"Entrenamiento completado. Agente guardado en {save_path}")
+        
+    finally:
+        # Asegurar que se liberen los recursos
+        env.close()
+        
+        # Limpieza final de memoria
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

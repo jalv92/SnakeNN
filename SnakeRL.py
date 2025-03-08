@@ -49,6 +49,11 @@ class SnakeGame:
         self.max_steps_without_food = GRID_WIDTH * GRID_HEIGHT * 2
         self.last_positions = deque(maxlen=10)
         self.reset()
+    
+    def close(self):
+        """Cierra y libera recursos de Pygame"""
+        if self.render_mode:
+            pygame.quit()
 
     def reset(self):
         """Reinicia el juego"""
