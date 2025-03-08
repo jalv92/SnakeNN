@@ -348,12 +348,13 @@ SKILL_LIBRARY_SIZE = 20       # Number of skills to store in library
 # ------------------- Dynamic Neural Module -------------------
 class DynamicLayer(nn.Module):
     """Neural layer with dynamic growth capabilities"""
-    def __init__(self, input_size, output_size, growth_rate=0.1):
+    def __init__(self, input_size, output_size, growth_rate=0.1, on_resize_callback=None):
         super(DynamicLayer, self).__init__()
         self.input_size = input_size
         self.current_output_size = output_size
         self.max_output_size = MAX_NEURONS_PER_LAYER
         self.growth_rate = growth_rate
+        self.on_resize_callback = on_resize_callback
         
         # Initialize main weight matrix
         self.weight = nn.Parameter(torch.Tensor(output_size, input_size))
@@ -476,9 +477,18 @@ class DynamicLayer(nn.Module):
             self.prune_mask = new_prune_mask
             
             # Update current size
+            old_size = self.current_output_size
             self.current_output_size += growth_neurons
             
             print(f"Layer grew by {growth_neurons} neurons, new size: {self.current_output_size}")
+            
+            # Notify about the resize if callback is provided
+            if self.on_resize_callback is not None:
+                try:
+                    self.on_resize_callback(old_size, self.current_output_size)
+                except Exception as e:
+                    print(f"Error en callback de cambio de tamaño: {e}")
+                    
             return True
     
     def apply_hebbian_learning(self, learning_rate=HEBBIAN_LEARNING_RATE):
@@ -502,7 +512,11 @@ class DynamicLayer(nn.Module):
                     weight_norm = torch.norm(self.weight[i])
                     if weight_norm > 3.0:  # Threshold for normalization
                         self.weight[i] = 3.0 * self.weight[i] / weight_norm
-
+    
+    def set_resize_callback(self, callback):
+        """Establece un callback que será llamado cuando cambie el tamaño de la capa"""
+        self.on_resize_callback = callback
+    
     def get_output_size(self):
         """Return current number of output neurons"""
         return self.current_output_size
@@ -548,6 +562,60 @@ class PerceptionModule(nn.Module):
         # Feature attention mechanism
         self.attention = nn.Parameter(torch.ones(output_size) / output_size)  # Initial uniform attention
         
+        # Listeners for size changes
+        self.output_size_listeners = []
+        
+        # Register callbacks for dynamic layers
+        self._register_layer_callbacks()
+        
+    def _register_layer_callbacks(self):
+        """Registra callbacks para las capas dinámicas"""
+        # Register callbacks for all DynamicLayers
+        for i, module in enumerate(self.feature_extractor):
+            if isinstance(module, DynamicLayer):
+                # Last dynamic layer affects output size
+                if i == 2:  # El segundo DynamicLayer es el que afecta la salida
+                    module.set_resize_callback(self._handle_output_size_change)
+    
+    def _handle_output_size_change(self, old_size, new_size):
+        """Maneja cambios en el tamaño de salida y notifica a los módulos dependientes"""
+        print(f"PerceptionModule output size change: {old_size} -> {new_size}")
+        
+        # Update output size
+        self.output_size = new_size
+        
+        # Resize attention parameter
+        old_attention = self.attention.data
+        new_attention = torch.ones(new_size, device=self.attention.device) / new_size
+        
+        # Copy old values where possible
+        if old_size <= new_size:
+            new_attention[:old_size] = old_attention
+        else:
+            new_attention = old_attention[:new_size]
+        
+        # Normalize attention
+        new_attention = F.softmax(new_attention, dim=0)
+        
+        # Replace the parameter
+        self.attention = nn.Parameter(new_attention)
+        
+        # Notify all listeners about the size change
+        for listener in self.output_size_listeners:
+            try:
+                listener(old_size, new_size)
+            except Exception as e:
+                print(f"Error al notificar cambio de tamaño: {e}")
+                
+    def register_output_size_listener(self, callback):
+        """Registra un callback para ser notificado cuando cambia el tamaño de salida"""
+        if callback not in self.output_size_listeners:
+            self.output_size_listeners.append(callback)
+            
+    def get_current_output_size(self):
+        """Devuelve el tamaño de salida actual"""
+        return self.output_size
+        
     def forward(self, state):
         features = self.feature_extractor(state)
         # Apply attention - highlight important features
@@ -569,11 +637,82 @@ class PerceptionModule(nn.Module):
             self.attention.data += 0.1 * importance_signals
             # Normalize attention
             self.attention.data = F.softmax(self.attention.data, dim=0)
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Sobrecarga para manejar cambios en las dimensiones durante la carga"""
+        # Verificar si hay diferencias en las dimensiones
+        if any('feature_extractor.0.weight' in k or 'feature_extractor.2.weight' in k for k in state_dict.keys()):
+            # Primera capa dinámica
+            if 'feature_extractor.0.weight' in state_dict:
+                saved_first_layer_size = state_dict['feature_extractor.0.weight'].shape[0]
+                current_first_layer_size = self.feature_extractor[0].weight.shape[0]
+                
+                if saved_first_layer_size != current_first_layer_size:
+                    print(f"Adaptando primera capa de PerceptionModule: {current_first_layer_size} -> {saved_first_layer_size}")
+                    # Crear nueva capa dinámica con el tamaño correcto
+                    new_layer = DynamicLayer(self.input_size, saved_first_layer_size)
+                    new_layer.to(self.feature_extractor[0].weight.device)
+                    
+                    # Reemplazar la capa
+                    self.feature_extractor[0] = new_layer
+            
+            # Segunda capa dinámica
+            if 'feature_extractor.2.weight' in state_dict:
+                saved_second_layer_size = state_dict['feature_extractor.2.weight'].shape[0]
+                current_second_layer_size = self.feature_extractor[2].weight.shape[0]
+                
+                # Si la primera capa cambió, necesitamos actualizar la entrada de la segunda
+                first_layer_output = self.feature_extractor[0].current_output_size
+                
+                if saved_second_layer_size != current_second_layer_size or self.feature_extractor[2].input_size != first_layer_output:
+                    print(f"Adaptando segunda capa de PerceptionModule: {current_second_layer_size} -> {saved_second_layer_size}")
+                    # Crear nueva capa con el tamaño correcto
+                    new_layer = DynamicLayer(first_layer_output, saved_second_layer_size)
+                    new_layer.to(self.feature_extractor[2].weight.device)
+                    
+                    # Reemplazar la capa
+                    self.feature_extractor[2] = new_layer
+            
+            # Actualizar el tamaño de salida y attention
+            if 'feature_extractor.2.weight' in state_dict:
+                new_output_size = state_dict['feature_extractor.2.weight'].shape[0]
+                
+                if new_output_size != self.output_size:
+                    print(f"Actualizando output_size de PerceptionModule: {self.output_size} -> {new_output_size}")
+                    self.output_size = new_output_size
+                    
+                    # Actualizar attention
+                    if 'attention' in state_dict:
+                        # Usar el attention guardado
+                        new_attention = state_dict['attention']
+                    else:
+                        # Crear nuevo attention
+                        new_attention = torch.ones(new_output_size, device=self.attention.device) / new_output_size
+                    
+                    self.attention = nn.Parameter(new_attention)
+            
+            # Volver a registrar callbacks después de los cambios
+            self._register_layer_callbacks()
+        
+        # Ahora que las dimensiones coinciden, cargar el estado
+        result = super().load_state_dict(state_dict, strict)
+        
+        # Notificar a todos los listeners sobre el cambio de tamaño
+        for listener in self.output_size_listeners:
+            try:
+                listener(0, self.output_size)  # 0 como valor ficticio para old_size
+            except Exception as e:
+                print(f"Error al notificar cambio de tamaño: {e}")
+                
+        return result
 
 class NavigationModule(nn.Module):
     """Module specialized in planning routes and obstacle avoidance"""
     def __init__(self, input_size, output_size):
         super(NavigationModule, self).__init__()
+        
+        self.input_size = input_size
+        self.output_size = output_size
         
         # A-star like navigation system using neural approximation
         self.pathfinder = nn.Sequential(
@@ -587,6 +726,149 @@ class NavigationModule(nn.Module):
         # Directional bias for different movement options
         self.direction_bias = nn.Parameter(torch.zeros(output_size))
         
+        # Listeners for size changes
+        self.output_size_listeners = []
+        
+        # Register callbacks for dynamic layers
+        self._register_layer_callbacks()
+    
+    def _register_layer_callbacks(self):
+        """Registra callbacks para las capas dinámicas"""
+        for i, module in enumerate(self.pathfinder):
+            if isinstance(module, DynamicLayer):
+                # Last dynamic layer affects output size
+                if i == 4:  # El último DynamicLayer es el que afecta la salida
+                    module.set_resize_callback(self._handle_output_size_change)
+    
+    def _handle_output_size_change(self, old_size, new_size):
+        """Maneja cambios en el tamaño de salida y notifica a los módulos dependientes"""
+        print(f"NavigationModule output size change: {old_size} -> {new_size}")
+        
+        # Update output size
+        self.output_size = new_size
+        
+        # Resize directional bias
+        old_bias = self.direction_bias.data
+        new_bias = torch.zeros(new_size, device=self.direction_bias.device)
+        
+        # Copy old values where possible
+        if old_size <= new_size:
+            new_bias[:old_size] = old_bias
+        else:
+            new_bias = old_bias[:new_size]
+        
+        # Replace the parameter
+        self.direction_bias = nn.Parameter(new_bias)
+        
+        # Notify all listeners about the size change
+        for listener in self.output_size_listeners:
+            try:
+                listener(old_size, new_size)
+            except Exception as e:
+                print(f"Error al notificar cambio de tamaño en NavigationModule: {e}")
+    
+    def handle_input_size_change(self, old_size, new_size, position_in_input=0):
+        """Maneja cambios en el tamaño de entrada"""
+        print(f"NavigationModule procesando cambio de tamaño de entrada: {old_size} -> {new_size} en posición {position_in_input}")
+        
+        # Calcular nuevo tamaño de entrada total
+        if position_in_input == 0:  # Si el cambio está en la primera parte del tensor concatenado
+            new_total_input = new_size + 8  # Asumiendo que position y target son vectores de 4
+        else:
+            new_total_input = self.input_size - old_size + new_size
+        
+        # Crear nuevas capas con pesos adaptados a las nuevas dimensiones
+        old_first_layer = self.pathfinder[0]
+        
+        # Crear un nuevo DynamicLayer con el nuevo tamaño de entrada
+        new_layer = DynamicLayer(new_total_input, old_first_layer.current_output_size)
+        
+        # Copiar pesos anteriores donde sea posible
+        with torch.no_grad():
+            # Determinar qué parte de los pesos copiar según la posición del cambio
+            if position_in_input == 0:
+                # El cambio está en la primera parte (features)
+                if new_size >= old_size:
+                    # Entrada creció
+                    new_layer.weight.data[:, :old_size] = old_first_layer.weight.data[:, :old_size]
+                    new_layer.weight.data[:, old_size:new_size] = 0.01 * torch.randn_like(new_layer.weight.data[:, old_size:new_size])
+                    new_layer.weight.data[:, new_size:] = old_first_layer.weight.data[:, old_size:]
+                else:
+                    # Entrada se redujo
+                    new_layer.weight.data[:, :new_size] = old_first_layer.weight.data[:, :new_size]
+                    new_layer.weight.data[:, new_size:] = old_first_layer.weight.data[:, old_size:]
+            else:
+                # El cambio está en otra parte (position o target)
+                # Simplemente ajustar la matriz de pesos según corresponda
+                if new_size >= old_size:
+                    new_layer.weight.data = F.pad(old_first_layer.weight.data, 
+                                              (0, new_size - old_size), 
+                                              "constant", 0)
+                else:
+                    new_layer.weight.data = old_first_layer.weight.data[:, :(old_first_layer.weight.data.shape[1] - (old_size - new_size))]
+            
+            # Copiar bias
+            new_layer.bias.data = old_first_layer.bias.data
+        
+        # Reemplazar la capa en el modelo
+        self.pathfinder[0] = new_layer
+        self.input_size = new_total_input
+        
+        # Registrar callback para la nueva capa
+        new_layer.set_resize_callback(lambda old_s, new_s: self._handle_middle_layer_resize(0, old_s, new_s))
+        
+        print(f"NavigationModule redimensionado a input_size={new_total_input}")
+        
+    def _handle_middle_layer_resize(self, layer_idx, old_size, new_size):
+        """Maneja cambios en el tamaño de las capas intermedias"""
+        if layer_idx + 2 >= len(self.pathfinder):
+            print(f"Error: Índice de capa {layer_idx} fuera de rango")
+            return
+            
+        print(f"NavigationModule: Capa intermedia {layer_idx} cambió de {old_size} a {new_size}")
+        
+        # Obtener la siguiente capa dinámica
+        next_layer_idx = layer_idx + 2  # Saltar ReLU
+        next_layer = self.pathfinder[next_layer_idx]
+        
+        if not isinstance(next_layer, DynamicLayer):
+            print(f"Error: Capa en índice {next_layer_idx} no es DynamicLayer")
+            return
+            
+        # Crear una nueva capa con el tamaño de entrada actualizado
+        new_layer = DynamicLayer(new_size, next_layer.current_output_size)
+        
+        # Copiar pesos existentes donde sea posible
+        with torch.no_grad():
+            if new_size >= old_size:
+                # Entrada creció
+                new_layer.weight.data[:, :old_size] = next_layer.weight.data[:, :old_size]
+                new_layer.weight.data[:, old_size:] = 0.01 * torch.randn_like(new_layer.weight.data[:, old_size:])
+            else:
+                # Entrada se redujo
+                new_layer.weight.data[:, :new_size] = next_layer.weight.data[:, :new_size]
+            
+            # Copiar bias
+            new_layer.bias.data = next_layer.bias.data
+        
+        # Reemplazar la capa
+        self.pathfinder[next_layer_idx] = new_layer
+        
+        # Registrar callback para la nueva capa si no es la última
+        if next_layer_idx < len(self.pathfinder) - 1:
+            new_layer.set_resize_callback(lambda old_s, new_s: self._handle_middle_layer_resize(next_layer_idx, old_s, new_s))
+        else:
+            new_layer.set_resize_callback(self._handle_output_size_change)
+    
+    def register_output_size_listener(self, callback):
+        """Registra un callback para ser notificado cuando cambia el tamaño de salida"""
+        if callback not in self.output_size_listeners:
+            self.output_size_listeners.append(callback)
+    
+    def get_current_output_size(self):
+        """Devuelve el tamaño de salida actual"""
+        return self.output_size
+        
     def forward(self, features, position, target):
         # Concat features with position and target info
         navigation_input = torch.cat([features, position, target], dim=1)
@@ -597,6 +879,72 @@ class NavigationModule(nn.Module):
         with torch.no_grad():
             for action in successful_actions:
                 self.direction_bias.data[action] += learning_rate
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Sobrecarga para manejar cambios en las dimensiones durante la carga"""
+        # Verificar si hay diferencias en las dimensiones para cada capa dinámica
+        layers_to_check = [
+            ('pathfinder.0.weight', 0),
+            ('pathfinder.2.weight', 2),
+            ('pathfinder.4.weight', 4)
+        ]
+        
+        for key, idx in layers_to_check:
+            if key in state_dict:
+                saved_shape = state_dict[key].shape
+                current_shape = self.pathfinder[idx].weight.shape
+                
+                if saved_shape != current_shape:
+                    print(f"Adaptando capa {idx} de NavigationModule: {current_shape} -> {saved_shape}")
+                    
+                    # Determinar los tamaños de entrada y salida
+                    if idx == 0:
+                        # Primera capa
+                        input_size = self.input_size
+                        output_size = saved_shape[0]
+                    elif idx == 2:
+                        # Segunda capa
+                        input_size = self.pathfinder[0].current_output_size
+                        output_size = saved_shape[0]
+                    elif idx == 4:
+                        # Tercera capa
+                        input_size = self.pathfinder[2].current_output_size
+                        output_size = saved_shape[0]
+                    
+                    # Crear nueva capa con el tamaño correcto
+                    new_layer = DynamicLayer(input_size, output_size)
+                    new_layer.to(self.pathfinder[idx].weight.device)
+                    
+                    # Reemplazar la capa
+                    self.pathfinder[idx] = new_layer
+                    
+                    # Si es la última capa, actualizar también output_size y direction_bias
+                    if idx == 4 and output_size != self.output_size:
+                        print(f"Actualizando output_size de NavigationModule: {self.output_size} -> {output_size}")
+                        self.output_size = output_size
+                        
+                        # Actualizar direction_bias
+                        if 'direction_bias' in state_dict:
+                            # Usar el bias guardado
+                            self.direction_bias = nn.Parameter(state_dict['direction_bias'])
+                        else:
+                            # Crear nuevo bias
+                            self.direction_bias = nn.Parameter(torch.zeros(output_size, device=self.direction_bias.device))
+        
+        # Volver a registrar callbacks después de los cambios
+        self._register_layer_callbacks()
+        
+        # Ahora que las dimensiones coinciden, cargar el estado
+        result = super().load_state_dict(state_dict, strict)
+        
+        # Notificar a todos los listeners sobre el cambio de tamaño
+        for listener in self.output_size_listeners:
+            try:
+                listener(0, self.output_size)  # 0 como valor ficticio para old_size
+            except Exception as e:
+                print(f"Error al notificar cambio de tamaño en NavigationModule: {e}")
+                
+        return result
 
 class PredictionModule(nn.Module):
     """Module for predicting outcomes of actions"""
@@ -748,6 +1096,11 @@ class ExecutiveModule(nn.Module):
     def __init__(self, perception_size, navigation_size, prediction_size, action_size):
         super(ExecutiveModule, self).__init__()
         
+        self.perception_size = perception_size
+        self.navigation_size = navigation_size
+        self.prediction_size = prediction_size
+        self.action_size = action_size
+        
         combined_input_size = perception_size + navigation_size + prediction_size
         
         # Integration network
@@ -764,6 +1117,218 @@ class ExecutiveModule(nn.Module):
         # Module attention weights (how much to weight each module's output)
         self.module_attention = nn.Parameter(torch.tensor([0.4, 0.4, 0.2]))  # Initial weights
         
+        # Register callbacks for dynamic layers
+        self._register_layer_callbacks()
+    
+    def _register_layer_callbacks(self):
+        """Registra callbacks para las capas dinámicas"""
+        for i, module in enumerate(self.integrator):
+            if isinstance(module, DynamicLayer):
+                module.set_resize_callback(lambda old_s, new_s, idx=i: self._handle_integrator_resize(idx, old_s, new_s))
+        
+        # Registrar callback para action_selector
+        self.action_selector.set_resize_callback(self._handle_action_selector_resize)
+    
+    def _handle_integrator_resize(self, layer_idx, old_size, new_size):
+        """Maneja cambios en el tamaño de las capas del integrador"""
+        print(f"ExecutiveModule: Capa integradora {layer_idx} cambió de {old_size} a {new_size}")
+        
+        # Si no es la última capa, actualizar la siguiente
+        if layer_idx + 2 < len(self.integrator):
+            next_layer_idx = layer_idx + 2  # Saltar ReLU
+            next_layer = self.integrator[next_layer_idx]
+            
+            if isinstance(next_layer, DynamicLayer):
+                # Crear una nueva capa con el tamaño de entrada actualizado
+                new_layer = DynamicLayer(new_size, next_layer.current_output_size)
+                
+                # Copiar pesos existentes donde sea posible
+                with torch.no_grad():
+                    if new_size >= old_size:
+                        # Entrada creció
+                        new_layer.weight.data[:, :old_size] = next_layer.weight.data[:, :old_size]
+                        new_layer.weight.data[:, old_size:] = 0.01 * torch.randn_like(new_layer.weight.data[:, old_size:])
+                    else:
+                        # Entrada se redujo
+                        new_layer.weight.data[:, :new_size] = next_layer.weight.data[:, :new_size]
+                    
+                    # Copiar bias
+                    new_layer.bias.data = next_layer.bias.data
+                
+                # Reemplazar la capa
+                self.integrator[next_layer_idx] = new_layer
+                
+                # Registrar callback para la nueva capa
+                new_layer.set_resize_callback(lambda old_s, new_s: self._handle_integrator_resize(next_layer_idx, old_s, new_s))
+        else:
+            # Si es la última capa del integrador, actualizar el selector de acciones
+            with torch.no_grad():
+                # Crear un nuevo selector con el tamaño de entrada actualizado
+                new_selector = DynamicLayer(new_size, self.action_size)
+                
+                # Copiar pesos existentes donde sea posible
+                if new_size >= old_size:
+                    # Entrada creció
+                    new_selector.weight.data[:, :old_size] = self.action_selector.weight.data[:, :old_size]
+                    new_selector.weight.data[:, old_size:] = 0.01 * torch.randn_like(new_selector.weight.data[:, old_size:])
+                else:
+                    # Entrada se redujo
+                    new_selector.weight.data[:, :new_size] = self.action_selector.weight.data[:, :new_size]
+                
+                # Copiar bias
+                new_selector.bias.data = self.action_selector.bias.data
+                
+                # Reemplazar el selector
+                self.action_selector = new_selector
+                
+                # Registrar callback
+                new_selector.set_resize_callback(self._handle_action_selector_resize)
+    
+    def _handle_action_selector_resize(self, old_size, new_size):
+        """Maneja cambios en el tamaño del selector de acciones"""
+        print(f"ExecutiveModule: Action selector cambió de {old_size} a {new_size}")
+        # No necesitamos hacer nada aquí ya que esto cambiaría el número de acciones,
+        # que no es algo que queramos cambiar dinámicamente
+    
+    def handle_perception_size_change(self, old_size, new_size):
+        """Maneja cambios en el tamaño del módulo de percepción"""
+        print(f"ExecutiveModule procesando cambio en percepción: {old_size} -> {new_size}")
+        
+        # Calcular nuevo tamaño de entrada combinada
+        new_combined_size = new_size + self.navigation_size + self.prediction_size
+        
+        # Actualizar el tamaño de percepción
+        self.perception_size = new_size
+        
+        # Crear una nueva primera capa con el tamaño de entrada actualizado
+        old_first_layer = self.integrator[0]
+        new_layer = DynamicLayer(new_combined_size, old_first_layer.current_output_size)
+        
+        # Copiar pesos existentes donde sea posible
+        with torch.no_grad():
+            if new_size >= old_size:
+                # Percepción creció
+                new_layer.weight.data[:, :old_size] = old_first_layer.weight.data[:, :old_size]
+                new_layer.weight.data[:, old_size:new_size] = 0.01 * torch.randn_like(new_layer.weight.data[:, old_size:new_size])
+                new_layer.weight.data[:, new_size:] = old_first_layer.weight.data[:, old_size:]
+            else:
+                # Percepción se redujo
+                new_layer.weight.data[:, :new_size] = old_first_layer.weight.data[:, :new_size]
+                new_layer.weight.data[:, new_size:] = old_first_layer.weight.data[:, old_size:]
+            
+            # Copiar bias
+            new_layer.bias.data = old_first_layer.bias.data
+        
+        # Reemplazar la capa
+        self.integrator[0] = new_layer
+        
+        # Registrar callback para la nueva capa
+        new_layer.set_resize_callback(lambda old_s, new_s: self._handle_integrator_resize(0, old_s, new_s))
+    
+    def handle_navigation_size_change(self, old_size, new_size):
+        """Maneja cambios en el tamaño del módulo de navegación"""
+        print(f"ExecutiveModule procesando cambio en navegación: {old_size} -> {new_size}")
+        
+        # Calcular nuevo tamaño de entrada combinada
+        new_combined_size = self.perception_size + new_size + self.prediction_size
+        
+        # Actualizar el tamaño de navegación
+        self.navigation_size = new_size
+        
+        # Crear una nueva primera capa con el tamaño de entrada actualizado
+        old_first_layer = self.integrator[0]
+        new_layer = DynamicLayer(new_combined_size, old_first_layer.current_output_size)
+        
+        # Copiar pesos existentes donde sea posible
+        with torch.no_grad():
+            perception_offset = self.perception_size
+            
+            if new_size >= old_size:
+                # Navegación creció
+                # Copiar pesos para percepción
+                new_layer.weight.data[:, :perception_offset] = old_first_layer.weight.data[:, :perception_offset]
+                
+                # Copiar pesos existentes para navegación
+                new_layer.weight.data[:, perception_offset:perception_offset+old_size] = \
+                    old_first_layer.weight.data[:, perception_offset:perception_offset+old_size]
+                
+                # Inicializar nuevos pesos para navegación
+                new_layer.weight.data[:, perception_offset+old_size:perception_offset+new_size] = \
+                    0.01 * torch.randn_like(new_layer.weight.data[:, perception_offset+old_size:perception_offset+new_size])
+                
+                # Copiar pesos para predicción
+                new_layer.weight.data[:, perception_offset+new_size:] = \
+                    old_first_layer.weight.data[:, perception_offset+old_size:]
+            else:
+                # Navegación se redujo
+                # Copiar pesos para percepción
+                new_layer.weight.data[:, :perception_offset] = old_first_layer.weight.data[:, :perception_offset]
+                
+                # Copiar pesos reducidos para navegación
+                new_layer.weight.data[:, perception_offset:perception_offset+new_size] = \
+                    old_first_layer.weight.data[:, perception_offset:perception_offset+new_size]
+                
+                # Copiar pesos para predicción
+                new_layer.weight.data[:, perception_offset+new_size:] = \
+                    old_first_layer.weight.data[:, perception_offset+old_size:]
+            
+            # Copiar bias
+            new_layer.bias.data = old_first_layer.bias.data
+        
+        # Reemplazar la capa
+        self.integrator[0] = new_layer
+        
+        # Registrar callback para la nueva capa
+        new_layer.set_resize_callback(lambda old_s, new_s: self._handle_integrator_resize(0, old_s, new_s))
+    
+    def handle_prediction_size_change(self, old_size, new_size):
+        """Maneja cambios en el tamaño del módulo de predicción"""
+        print(f"ExecutiveModule procesando cambio en predicción: {old_size} -> {new_size}")
+        
+        # Calcular nuevo tamaño de entrada combinada
+        new_combined_size = self.perception_size + self.navigation_size + new_size
+        
+        # Actualizar el tamaño de predicción
+        self.prediction_size = new_size
+        
+        # Crear una nueva primera capa con el tamaño de entrada actualizado
+        old_first_layer = self.integrator[0]
+        new_layer = DynamicLayer(new_combined_size, old_first_layer.current_output_size)
+        
+        # Copiar pesos existentes donde sea posible
+        with torch.no_grad():
+            prediction_offset = self.perception_size + self.navigation_size
+            
+            if new_size >= old_size:
+                # Predicción creció
+                # Copiar pesos para percepción y navegación
+                new_layer.weight.data[:, :prediction_offset] = old_first_layer.weight.data[:, :prediction_offset]
+                
+                # Copiar pesos existentes para predicción
+                new_layer.weight.data[:, prediction_offset:prediction_offset+old_size] = \
+                    old_first_layer.weight.data[:, prediction_offset:prediction_offset+old_size]
+                
+                # Inicializar nuevos pesos para predicción
+                new_layer.weight.data[:, prediction_offset+old_size:] = \
+                    0.01 * torch.randn_like(new_layer.weight.data[:, prediction_offset+old_size:])
+            else:
+                # Predicción se redujo
+                # Copiar pesos para percepción y navegación
+                new_layer.weight.data[:, :prediction_offset] = old_first_layer.weight.data[:, :prediction_offset]
+                
+                # Copiar pesos reducidos para predicción
+                new_layer.weight.data[:, prediction_offset:] = \
+                    old_first_layer.weight.data[:, prediction_offset:prediction_offset+new_size]
+            
+            # Copiar bias
+            new_layer.bias.data = old_first_layer.bias.data
+        
+        # Reemplazar la capa
+        self.integrator[0] = new_layer
+        
+        # Registrar callback para la nueva capa
+        new_layer.set_resize_callback(lambda old_s, new_s: self._handle_integrator_resize(0, old_s, new_s))
+    
     def forward(self, perception_out, navigation_out, prediction_out):
         """
         Coordina los módulos de percepción, navegación y predicción para tomar una decisión
@@ -851,1104 +1416,764 @@ class ExecutiveModule(nn.Module):
             self.module_attention.data = torch.clamp(self.module_attention.data, min=0.1)
             # Re-normalize
             self.module_attention.data = F.softmax(self.module_attention.data, dim=0)
-# ------------------- Meta-Learning System -------------------
-class MetaController:
-    """Meta-learning system that optimizes hyperparameters and learning strategies"""
-    def __init__(self, agent, learning_rate=META_LEARNING_RATE):
-        self.agent = agent
-        self.learning_rate = learning_rate
-        
-        # Performance history
-        self.performance_history = deque(maxlen=100)
-        self.reward_history = deque(maxlen=100)
-        
-        # Hyperparameter ranges
-        self.hyper_ranges = {
-            'learning_rate': (0.0001, 0.01),
-            'gamma': (0.9, 0.999),
-            'epsilon_decay': (0.95, 0.999),
-            'batch_size': (32, 128)
-        }
-        
-        # Strategy options
-        self.strategies = ['exploit', 'explore', 'diversify']
-        self.current_strategy = 'explore'  # Start with exploration
-        
-        # Epsilon for hyperparameter adjustments
-        self.meta_epsilon = 1.0
-        self.meta_epsilon_decay = 0.99
-        
-        # Architecture modification state
-        self.architecture_frozen = False
-        
-        # Curriculum learning state
-        self.curriculum_level = 0
-        self.curriculum_performance = 0.0
-        self.curriculum_episodes = 0
-        
-    def record_performance(self, episode_reward, episode_score):
-        """Record performance metrics for an episode"""
-        self.performance_history.append(episode_score)
-        self.reward_history.append(episode_reward)
     
-    def adjust_hyperparameters(self):
-        """Adjust agent hyperparameters based on recent performance"""
-        if len(self.performance_history) < 10:
-            return  # Not enough data
-            
-        # Calculate recent performance trend
-        recent_perf = list(self.performance_history)[-10:]
-        performance_trend = sum(recent_perf[-5:]) / 5 - sum(recent_perf[:5]) / 5
+    def load_state_dict(self, state_dict, strict=True):
+        """Sobrecarga para manejar cambios en las dimensiones durante la carga"""
+        # Verificar capas del integrador
+        layers_to_check = [
+            ('integrator.0.weight', 0),
+            ('integrator.2.weight', 2)
+        ]
         
-        # Random exploration vs greedy exploitation for hyperparameter adjustment
-        if random.random() < self.meta_epsilon:
-            # Explore: Random adjustments
-            self._random_hyperparameter_adjustment()
-        else:
-            # Exploit: Targeted adjustments based on performance
-            self._targeted_hyperparameter_adjustment(performance_trend)
-            
-        # Decay meta-epsilon
-        self.meta_epsilon *= self.meta_epsilon_decay
-        self.meta_epsilon = max(0.1, self.meta_epsilon)  # Keep some exploration
-    
-    def _random_hyperparameter_adjustment(self):
-        """Make random adjustments to hyperparameters for exploration"""
-        # Pick a random hyperparameter to adjust
-        param = random.choice(list(self.hyper_ranges.keys()))
+        # Variable para seguir si necesitamos actualizar action_selector
+        update_action_selector = False
+        integrator_output_size = 32  # Valor predeterminado
         
-        if param == 'batch_size':
-            # Batch size is discrete
-            min_val, max_val = self.hyper_ranges[param]
-            current = getattr(self.agent, param)
-            new_val = current * random.choice([0.5, 0.75, 1.0, 1.25, 1.5])
-            new_val = max(min_val, min(max_val, int(new_val)))
-            new_val = 2 ** int(math.log2(new_val))  # Make it a power of 2
-            setattr(self.agent, param, new_val)
-            print(f"Meta-controller randomly adjusted {param}: {current} -> {new_val}")
-        else:
-            # Continuous hyperparameters
-            min_val, max_val = self.hyper_ranges[param]
-            current = getattr(self.agent, param)
-            # Random adjustment within ±20%
-            adjustment = random.uniform(0.8, 1.2)
-            new_val = current * adjustment
-            new_val = max(min_val, min(max_val, new_val))
-            setattr(self.agent, param, new_val)
-            print(f"Meta-controller randomly adjusted {param}: {current:.6f} -> {new_val:.6f}")
-    
-    def _targeted_hyperparameter_adjustment(self, performance_trend):
-        """Make targeted adjustments based on performance trends"""
-        if performance_trend > 0:
-            # Performance improving - make smaller adjustments
-            adjustment_size = 0.05
-            print("Performance improving, making fine-tuning adjustments")
-        else:
-            # Performance stagnant or declining - make larger adjustments
-            adjustment_size = 0.2
-            print("Performance stagnant, making larger adjustments")
-        
-        # Learning rate adjustment
-        if abs(performance_trend) < 0.5:
-            # Fine-tuning phase - reduce learning rate
-            current_lr = self.agent.learning_rate
-            new_lr = max(self.hyper_ranges['learning_rate'][0], 
-                        current_lr * (1 - adjustment_size))
-            self.agent.learning_rate = new_lr
-            print(f"Adjusted learning rate: {current_lr:.6f} -> {new_lr:.6f}")
-            
-            # Update optimizer learning rate
-            for param_group in self.agent.optimizer.param_groups:
-                param_group['lr'] = new_lr
-        
-        # Adaptive batch sizing - keep between 32 and 64
-        current_batch = self.agent.batch_size
-        if performance_trend > 0.5:  # Good performance improvement
-            # If performance is improving, try increasing batch size for efficiency
-            if current_batch < 64:
-                new_batch = min(64, int(current_batch * 1.5))
-                # Ensure it's a power of 2
-                new_batch = 2 ** int(math.log2(new_batch) + 0.5)
-                if new_batch != current_batch:
-                    self.agent.batch_size = new_batch
-                    print(f"Increased batch size: {current_batch} -> {new_batch}")
-        elif performance_trend < -0.3:  # Performance declining
-            # If performance is declining, try decreasing batch size for better learning
-            if current_batch > 32:
-                new_batch = max(32, int(current_batch * 0.75))
-                # Ensure it's a power of 2
-                new_batch = 2 ** int(math.log2(new_batch) + 0.5)
-                if new_batch != current_batch:
-                    self.agent.batch_size = new_batch
-                    print(f"Decreased batch size: {current_batch} -> {new_batch}")
-        
-        # Exploration-exploitation balance
-        if performance_trend < -1.0:
-            # Significant performance decline - increase exploration
-            current_epsilon = self.agent.epsilon
-            new_epsilon = min(0.5, current_epsilon * (1 + adjustment_size))
-            self.agent.epsilon = new_epsilon
-            print(f"Increased exploration (ε): {current_epsilon:.4f} -> {new_epsilon:.4f}")
-        
-        # Discount factor adjustment based on performance stability
-        reward_variance = np.var(list(self.reward_history)[-10:])
-        if reward_variance > 100:  # High variance
-            # Reduce gamma to focus more on immediate rewards
-            current_gamma = self.agent.gamma
-            new_gamma = max(0.9, current_gamma * (1 - adjustment_size * 0.1))
-            self.agent.gamma = new_gamma
-            print(f"Adjusted discount factor (γ): {current_gamma:.4f} -> {new_gamma:.4f}")
-    
-    def adjust_architecture(self):
-        """Decide whether to grow or prune the neural network"""
-        if self.architecture_frozen:
-            return  # Architecture changes are frozen
-            
-        # Check recent performance trend to decide if architecture changes are needed
-        if len(self.performance_history) < 20:
-            return  # Not enough data
-            
-        recent_scores = list(self.performance_history)[-20:]
-        first_half = sum(recent_scores[:10]) / 10
-        second_half = sum(recent_scores[10:]) / 10
-        
-        performance_trend = second_half - first_half
-        
-        if performance_trend < -0.5:
-            # Performance declining - try growing the network
-            self._grow_network()
-        elif performance_trend > 2.0:
-            # Significant improvement - try pruning to prevent overfitting
-            self._prune_network()
-        elif random.random() < 0.1:
-            # Occasionally try architecture changes regardless of performance
-            if random.random() < 0.7:
-                self._grow_network()
-            else:
-                self._prune_network()
-    
-    def _grow_network(self):
-        """Signal the agent to grow its neural network"""
-        growth_occurred = False
-        
-        # Try to grow each dynamic layer in the modules
-        for name, module in self.agent.modules.items():
-            if isinstance(module, nn.Module):
-                for child in module.modules():
-                    if isinstance(child, DynamicLayer):
-                        if child.grow_neurons():
-                            growth_occurred = True
-        
-        if growth_occurred:
-            # Reinitialize optimizer since parameter shapes changed
-            self.agent.setup_optimizer()
-            print("Meta-controller grew network architecture")
-    
-    def _prune_network(self):
-        """Signal the agent to prune unused connections"""
-        # Try to prune each dynamic layer in the modules
-        for name, module in self.agent.modules.items():
-            if isinstance(module, nn.Module):
-                for child in module.modules():
-                    if isinstance(child, DynamicLayer):
-                        child.prune_connections()
-        
-        print("Meta-controller pruned network connections")
-    
-    def adjust_learning_strategy(self):
-        """Adjust the learning strategy based on performance"""
-        if len(self.performance_history) < 20:
-            return  # Not enough data
-            
-        # Analyze recent performance
-        recent_scores = list(self.performance_history)[-20:]
-        avg_score = sum(recent_scores) / len(recent_scores)
-        score_variance = np.var(recent_scores)
-        
-        # Decide on strategy change
-        if avg_score < 2 and self.current_strategy != 'explore':
-            # Low scores - switch to exploration
-            self.current_strategy = 'explore'
-            self.agent.epsilon = min(0.5, self.agent.epsilon * 2)  # Increase exploration
-            print(f"Meta-controller switched to EXPLORE strategy (ε={self.agent.epsilon:.4f})")
-        elif avg_score > 10 and score_variance < 5 and self.current_strategy != 'exploit':
-            # High consistent scores - switch to exploitation
-            self.current_strategy = 'exploit'
-            self.agent.epsilon = max(0.01, self.agent.epsilon * 0.5)  # Reduce exploration
-            print(f"Meta-controller switched to EXPLOIT strategy (ε={self.agent.epsilon:.4f})")
-        elif score_variance > 20 and self.current_strategy != 'diversify':
-            # High variance - switch to diversification
-            self.current_strategy = 'diversify'
-            self.agent.epsilon = 0.2  # Balanced exploration
-            # Increase batch diversity
-            self.agent.batch_size = min(128, self.agent.batch_size * 2)
-            print(f"Meta-controller switched to DIVERSIFY strategy (ε={self.agent.epsilon:.4f}, batch={self.agent.batch_size})")
-    
-    def update_curriculum(self, env):
-        """Update the curriculum difficulty based on agent performance"""
-        if len(self.performance_history) < 10:
-            return  # Not enough data
-            
-        # Calculate success rate on current level
-        recent_scores = list(self.performance_history)[-10:]
-        success_threshold = 5  # Consider score >= 5 as success for curriculum
-        success_rate = sum(1 for score in recent_scores if score >= success_threshold) / len(recent_scores)
-        
-        self.curriculum_performance = 0.8 * self.curriculum_performance + 0.2 * success_rate
-        self.curriculum_episodes += 1
-        
-        # Check if it's time to adjust difficulty
-        if self.curriculum_episodes >= 100 and self.curriculum_performance >= DIFFICULTY_ADJUST_THRESHOLD:
-            # Good enough performance - increase difficulty
-            self.curriculum_level = min(2, self.curriculum_level + 1)  # Max difficulty is 2
-            env.difficulty = self.curriculum_level
-            
-            # Reset curriculum tracking
-            self.curriculum_performance = 0.0
-            self.curriculum_episodes = 0
-            
-            print(f"Meta-controller increased curriculum difficulty to level {self.curriculum_level}")
-            return True
-        elif self.curriculum_episodes >= 200 and self.curriculum_performance < 0.3:
-            # Very poor performance for extended time - decrease difficulty
-            self.curriculum_level = max(0, self.curriculum_level - 1)
-            env.difficulty = self.curriculum_level
-            
-            # Reset curriculum tracking
-            self.curriculum_performance = 0.0
-            self.curriculum_episodes = 0
-            
-            print(f"Meta-controller decreased curriculum difficulty to level {self.curriculum_level}")
-            return True
-            
-        return False  # No changes made
-
-# ------------------- Episodic Memory System -------------------
-class Episode:
-    """Container for a complete game episode"""
-    def __init__(self, max_length=1000):
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.next_states = []
-        self.dones = []
-        self.importance = 0.0  # Importance score for this episode
-        self.score = 0  # Final game score
-        self.max_length = max_length
-    
-    def add(self, state, action, reward, next_state, done):
-        """Add a step to the episode"""
-        if len(self.states) < self.max_length:
-            self.states.append(state)
-            self.actions.append(action)
-            self.rewards.append(reward)
-            self.next_states.append(next_state)
-            self.dones.append(done)
-            
-            # Update running score
-            if reward > 5:  # Approximate threshold for eating food
-                self.score += 1
-    
-    def calculate_importance(self):
-        """Calculate importance of this episode for replay"""
-        # Base importance on final score
-        score_importance = min(1.0, self.score / 10)
-        
-        # High reward moments
-        high_reward_moments = sum(1 for r in self.rewards if r > 5)
-        reward_importance = min(1.0, high_reward_moments / 5)
-        
-        # Unusual transitions (high surprisal)
-        state_differences = []
-        for i in range(len(self.states) - 1):
-            if not self.dones[i]:
-                diff = np.mean(np.abs(np.array(self.next_states[i]) - np.array(self.states[i+1])))
-                state_differences.append(diff)
-        
-        surprisal_importance = min(1.0, sum(state_differences) / (len(state_differences) + 1e-5) / 10)
-        
-        # Combine importance factors
-        self.importance = 0.5 * score_importance + 0.3 * reward_importance + 0.2 * surprisal_importance
-        return self.importance
-    
-    def get_transitions(self):
-        """Get all transitions in this episode"""
-        return list(zip(self.states, self.actions, self.rewards, self.next_states, self.dones))
-    
-    def get_random_batch(self, batch_size):
-        """Get a random batch of transitions from this episode"""
-        if len(self.states) <= batch_size:
-            return self.get_transitions()
-        
-        indices = random.sample(range(len(self.states)), batch_size)
-        return [(self.states[i], self.actions[i], self.rewards[i], 
-                 self.next_states[i], self.dones[i]) for i in indices]
-    
-    def get_sequence(self, start_idx, length):
-        """Get a consecutive sequence of transitions starting at start_idx"""
-        end_idx = min(start_idx + length, len(self.states))
-        return [(self.states[i], self.actions[i], self.rewards[i], 
-                 self.next_states[i], self.dones[i]) for i in range(start_idx, end_idx)]
-
-class EpisodicMemory:
-    """Enhanced memory system with episodic storage and causal reasoning"""
-    def __init__(self, capacity=EPISODE_MEMORY_SIZE):
-        self.episodes = deque(maxlen=capacity)
-        self.current_episode = Episode()
-        self.causal_memory = deque(maxlen=CAUSAL_MEMORY_CAPACITY)
-        
-        # Importance threshold for causal memory
-        self.importance_threshold = REPLAY_IMPORTANCE_THRESHOLD
-    
-    def add(self, state, action, reward, next_state, done):
-        """Add a transition to the current episode"""
-        self.current_episode.add(state, action, reward, next_state, done)
-        
-        # If episode ends, store it and start a new one
-        if done:
-            self.end_episode()
-    
-    def end_episode(self):
-        """End the current episode and store it if valuable"""
-        if len(self.current_episode.states) > 0:
-            importance = self.current_episode.calculate_importance()
-            
-            # Store the episode
-            self.episodes.append(self.current_episode)
-            
-            # If important episode, analyze for causal patterns
-            if importance > self.importance_threshold:
-                self._analyze_causal_patterns(self.current_episode)
-            
-            # Start a new episode
-            self.current_episode = Episode()
-    
-    def _analyze_causal_patterns(self, episode):
-        """Identify causal patterns in important episodes"""
-        # Find high-reward moments
-        high_reward_indices = [i for i, r in enumerate(episode.rewards) if r > 5]
-        
-        for idx in high_reward_indices:
-            # Look at the sequence leading to high reward (up to 10 steps back)
-            start_idx = max(0, idx - 10)
-            causal_sequence = episode.get_sequence(start_idx, idx - start_idx + 1)
-            
-            # Store this causal sequence
-            self.causal_memory.append({
-                'sequence': causal_sequence,
-                'outcome_reward': episode.rewards[idx],
-                'context': episode.states[start_idx],  # Initial context
-                'frequency': 1  # How often we've seen this pattern
-            })
-            
-            # Optionally: Consolidate similar causal patterns
-            self._consolidate_causal_patterns()
-    
-    def _consolidate_causal_patterns(self):
-        """Consolidate similar causal patterns to identify common causes"""
-        if len(self.causal_memory) <= 1:
-            return
-            
-        # Compare latest pattern to others
-        latest = self.causal_memory[-1]
-        
-        for i, pattern in enumerate(list(self.causal_memory)[:-1]):
-            # Check if contexts are similar
-            context_similarity = self._calculate_state_similarity(
-                latest['context'], pattern['context'])
-            
-            # Check if outcomes are similar
-            reward_similarity = abs(latest['outcome_reward'] - pattern['outcome_reward']) < 1.0
-            
-            if context_similarity > 0.8 and reward_similarity:
-                # These patterns are similar - consolidate
-                pattern['frequency'] += 1
+        for key, idx in layers_to_check:
+            if key in state_dict:
+                saved_shape = state_dict[key].shape
+                current_shape = self.integrator[idx].weight.shape
                 
-                # If this identical pattern already exists, remove the new one
-                if context_similarity > 0.95:
-                    self.causal_memory.pop()  # Remove the newest duplicate
-                    break
-    
-    def _calculate_state_similarity(self, state1, state2):
-        """Calculate similarity between two states"""
-        # Convert to numpy arrays if they aren't already
-        s1 = np.array(state1)
-        s2 = np.array(state2)
-        
-        # Normalize the states
-        s1_norm = np.linalg.norm(s1)
-        s2_norm = np.linalg.norm(s2)
-        
-        if s1_norm == 0 or s2_norm == 0:
-            return 0.0
-            
-        # Compute cosine similarity
-        similarity = np.dot(s1, s2) / (s1_norm * s2_norm)
-        return max(0, similarity)  # Ensure non-negative
-    
-    def sample_batch(self, batch_size):
-        """Sample a batch of transitions with emphasis on important episodes"""
-        if not self.episodes:
-            return None
-            
-        # Select episodes weighted by importance
-        importances = np.array([ep.importance for ep in self.episodes])
-        if sum(importances) == 0:
-            episode_probs = None  # Uniform
-        else:
-            episode_probs = importances / sum(importances)
-            
-        # Determinar cuántos episodios seleccionar (no más que los episodios con prob > 0)
-        max_episodes = len(self.episodes)
-        if episode_probs is not None:
-            # Contar elementos con probabilidad no-cero
-            non_zero_probs = np.count_nonzero(episode_probs)
-            max_episodes = min(max_episodes, non_zero_probs)
-        
-        # Asegurarnos de no intentar seleccionar más episodios de los disponibles
-        episodes_to_select = min(5, max_episodes)
-        
-        # Obtener episodios aleatorios si no hay suficientes
-        if episodes_to_select < 1:
-            # Fallback a selección aleatoria uniforme si no hay suficientes episodios
-            selected_episodes = [random.randint(0, len(self.episodes) - 1)]
-        else:
-            # Seleccionar episodios con las probabilidades calculadas
-            selected_episodes = np.random.choice(
-                len(self.episodes), 
-                episodes_to_select,
-                p=episode_probs, 
-                replace=False
-            )
-        
-        # Calculate transitions per episode
-        transitions_per_episode = batch_size // len(selected_episodes)
-        
-        # Get transitions from selected episodes
-        batch = []
-        for ep_idx in selected_episodes:
-            episode = self.episodes[ep_idx]
-            batch.extend(episode.get_random_batch(transitions_per_episode))
-            
-        # If we need more transitions, get them randomly
-        if len(batch) < batch_size:
-            additional_needed = batch_size - len(batch)
-            random_episode = random.choice(self.episodes)
-            batch.extend(random_episode.get_random_batch(additional_needed))
-            
-        return batch[:batch_size]  # Ensure we return exactly batch_size transitions
-    
-    def sample_causal_batch(self, state, batch_size):
-        """Sample relevant causal sequences based on current state"""
-        if not self.causal_memory:
-            return self.sample_batch(batch_size)  # Fall back to regular sampling
-            
-        # Find causal patterns with similar contexts to current state
-        similarities = [self._calculate_state_similarity(state, pattern['context']) 
-                       for pattern in self.causal_memory]
-        
-        # Select most relevant patterns
-        if max(similarities) < 0.5:
-            return self.sample_batch(batch_size)  # No relevant patterns, use regular sampling
-            
-        # Weight patterns by similarity and frequency
-        weights = [sim * pattern['frequency'] for sim, pattern in zip(similarities, self.causal_memory)]
-        probs = np.array(weights) / sum(weights)
-        
-        # Sample patterns
-        selected_indices = np.random.choice(
-            len(self.causal_memory),
-            min(3, len(self.causal_memory)),
-            p=probs,
-            replace=False
-        )
-        
-        # Collect transitions from selected patterns
-        batch = []
-        for idx in selected_indices:
-            pattern = self.causal_memory[idx]
-            batch.extend(pattern['sequence'])
-            
-        # If we need more transitions, get them randomly
-        if len(batch) < batch_size:
-            additional = self.sample_batch(batch_size - len(batch))
-            if additional:
-                batch.extend(additional)
-                
-        # Shuffle the batch to prevent sequence bias in learning
-        random.shuffle(batch)
-        return batch[:batch_size]  # Ensure we return exactly batch_size transitions
-    
-    def perform_counterfactual_analysis(self, state, action, reward, next_state):
-        """Analyze what might have happened with different actions"""
-        if not self.causal_memory:
-            return None
-            
-        # Find similar states in causal memory
-        similar_patterns = []
-        for pattern in self.causal_memory:
-            for i, (s, a, r, ns, _) in enumerate(pattern['sequence']):
-                similarity = self._calculate_state_similarity(state, s)
-                if similarity > 0.8 and a != action:
-                    # Found similar state where a different action was taken
-                    similar_patterns.append({
-                        'similarity': similarity,
-                        'action': a,
-                        'reward': r,
-                        'next_state': ns,
-                        'pattern_idx': i
-                    })
+                if saved_shape != current_shape:
+                    print(f"Adaptando capa {idx} de ExecutiveModule: {current_shape} -> {saved_shape}")
                     
-        if not similar_patterns:
-            return None
-            
-        # Sort by similarity
-        similar_patterns.sort(key=lambda x: x['similarity'], reverse=True)
+                    # Determinar los tamaños de entrada y salida
+                    if idx == 0:
+                        # Primera capa
+                        # Revisar si necesitamos actualizar combined_input_size
+                        saved_combined_size = saved_shape[1]
+                        current_combined_size = self.perception_size + self.navigation_size + self.prediction_size
+                        
+                        if saved_combined_size != current_combined_size:
+                            print(f"Advertencia: La dimensión de entrada combinada ha cambiado: {current_combined_size} -> {saved_combined_size}")
+                        
+                        input_size = saved_combined_size
+                        output_size = saved_shape[0]
+                    elif idx == 2:
+                        # Segunda capa
+                        input_size = self.integrator[0].current_output_size
+                        output_size = saved_shape[0]
+                        integrator_output_size = output_size
+                        update_action_selector = True
+                    
+                    # Crear nueva capa con el tamaño correcto
+                    new_layer = DynamicLayer(input_size, output_size)
+                    new_layer.to(self.integrator[idx].weight.device)
+                    
+                    # Reemplazar la capa
+                    self.integrator[idx] = new_layer
         
-        # Return the most similar alternative
-        return similar_patterns[0]
+        # Verificar action_selector
+        if 'action_selector.weight' in state_dict:
+            saved_shape = state_dict['action_selector.weight'].shape
+            current_shape = self.action_selector.weight.shape
+            
+            if saved_shape != current_shape or update_action_selector:
+                print(f"Adaptando action_selector de ExecutiveModule: {current_shape} -> {saved_shape}")
+                
+                # Crear nuevo action_selector con las dimensiones correctas
+                new_selector = DynamicLayer(integrator_output_size, self.action_size)
+                new_selector.to(self.action_selector.weight.device)
+                
+                # Reemplazar el selector
+                self.action_selector = new_selector
+        
+        # Volver a registrar callbacks después de los cambios
+        self._register_layer_callbacks()
+        
+        # Ahora que las dimensiones coinciden, cargar el estado
+        try:
+            result = super().load_state_dict(state_dict, strict)
+        except Exception as e:
+            print(f"Error al cargar estado para ExecutiveModule: {e}")
+            # Intento de carga parcial
+            result = None
+            for name, param in state_dict.items():
+                if name in self.state_dict():
+                    try:
+                        if isinstance(param, torch.nn.Parameter):
+                            param = param.data
+                        self.state_dict()[name].copy_(param)
+                    except Exception as e:
+                        print(f"  Error al cargar parámetro {name}: {e}")
+        
+        return result
 
-# ------------------- Curiosity-Based Learning -------------------
+# ------------------- Curiosity Module -------------------
 class CuriosityModule:
-    """Module for intrinsic motivation based on novelty and surprise"""
+    """Módulo de curiosidad para generar recompensas intrínsecas"""
     def __init__(self, state_size, action_size, device='cpu'):
         self.state_size = state_size
         self.action_size = action_size
         self.device = device
         
-        # Model to predict next state
+        # Contador de novelty para estados visitados
+        self.state_counts = {}
+        self.decay_factor = CURIOSITY_DECAY  # Factor de decaimiento de curiosidad
+        
+        # Modelo predictivo simple para estimar sorpresa
         self.forward_model = nn.Sequential(
             nn.Linear(state_size + action_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
             nn.ReLU(),
             nn.Linear(64, state_size)
         ).to(device)
         
-        # State novelty tracking
-        self.state_counts = {}  # Tracks visitation counts
-        self.state_visit_decay = 0.99  # Decay factor for counts
-        
-        # Surprise tracking
-        self.surprise_history = deque(maxlen=1000)
-        self.max_surprise = 1.0  # For normalization
-        
-        # Optimizer
+        # Optimizer para el modelo forward
         self.optimizer = optim.Adam(self.forward_model.parameters(), lr=0.001)
         
-        # Intrinsic reward scaling
-        self.curiosity_weight = CURIOSITY_WEIGHT
-        self.curiosity_decay = CURIOSITY_DECAY
-        
+        # Factor para balancear novelty vs surprise
+        self.novelty_weight = 0.6
+        self.surprise_weight = 0.4
+    
     def hash_state(self, state):
-        """Create a discrete hash for a continuous state"""
-        # Quantize state values for hashing
-        quantized = tuple(round(float(x) * 5) / 5 for x in state)
-        return hash(quantized)
+        """Convierte un estado en un hash discreto para contar visitas"""
+        if torch.is_tensor(state):
+            state_np = state.cpu().numpy().flatten()
+        else:
+            state_np = np.array(state).flatten()
+        
+        # Discretizar estado para hacer hash
+        discrete_state = tuple(np.round(state_np * 5).astype(int))
+        return hash(discrete_state)
     
     def compute_novelty_reward(self, state):
-        """Compute reward based on state novelty"""
+        """Calcula recompensa de novedad basada en conteo de estados"""
         state_hash = self.hash_state(state)
         
-        # Get visit count (default 0)
-        count = self.state_counts.get(state_hash, 0)
+        # Incrementar contador para este estado
+        if state_hash in self.state_counts:
+            self.state_counts[state_hash] += 1
+        else:
+            self.state_counts[state_hash] = 1
         
-        # Compute novelty (inversely proportional to visits)
-        novelty = 1.0 / (count + 1)
+        # Recompensa inversamente proporcional al conteo
+        count = self.state_counts[state_hash]
+        novelty_reward = 1.0 / np.sqrt(count)
         
-        # Update visit count
-        self.state_counts[state_hash] = count + 1
-        
-        # Periodically decay all counts to maintain exploration
-        if random.random() < 0.001:  # 0.1% chance each step
-            self._decay_counts()
-            
-        return novelty
+        # Limitar recompensa
+        return min(1.0, novelty_reward)
     
     def _decay_counts(self):
-        """Decay visit counts to encourage revisiting states"""
+        """Decae gradualmente los contadores de estados para renovar interés"""
         for state_hash in self.state_counts:
-            self.state_counts[state_hash] *= self.state_visit_decay
+            self.state_counts[state_hash] *= self.decay_factor
     
     def _prepare_action_tensor(self, action):
-        """Helper method to prepare action tensor correctly"""
-        # Determine if action is already a tensor
-        if isinstance(action, torch.Tensor):
-            # If it's a tensor, make sure it's properly shaped
-            if action.dim() == 0:  # If it's a scalar tensor
-                action_tensor = action.unsqueeze(0).long()
+        """Prepara un tensor de acción para el modelo forward"""
+        if not torch.is_tensor(action):
+            if isinstance(action, (int, np.integer)):
+                # Convertir acción escalar a one-hot
+                action_tensor = torch.zeros(self.action_size, device=self.device)
+                action_tensor[int(action)] = 1.0
             else:
-                action_tensor = action.long()
+                # Usar acción directamente si ya es un vector
+                action_tensor = torch.FloatTensor(action).to(self.device)
         else:
-            # If it's not a tensor, convert it
-            action_tensor = torch.tensor([action], dtype=torch.long).to(self.device)
+            action_tensor = action
             
-        # Convert to one-hot
-        return F.one_hot(action_tensor, num_classes=self.action_size).float().to(self.device)
+            # Asegurar forma correcta para one-hot
+            if action_tensor.dim() == 0:
+                # Convertir acción escalar a one-hot
+                action_idx = int(action_tensor.item())
+                action_tensor = torch.zeros(self.action_size, device=self.device)
+                action_tensor[action_idx] = 1.0
+        
+        return action_tensor
     
     def compute_surprise_reward(self, state, action, next_state):
-        """Compute reward based on prediction error (surprise)"""
-        try:
-            # Convert to tensors
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action_onehot = self._prepare_action_tensor(action)
-            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+        """Calcula recompensa de sorpresa basada en error de predicción"""
+        # Preparar entrada para el modelo
+        if not torch.is_tensor(state):
+            state_tensor = torch.FloatTensor(state).to(self.device)
+        else:
+            state_tensor = state.to(self.device)
             
-            # Predict next state
-            with torch.no_grad():
-                pred_input = torch.cat([state_tensor, action_onehot], dim=1)
-                predicted_next_state = self.forward_model(pred_input)
-                
-                # Compute prediction error
-                prediction_error = F.mse_loss(predicted_next_state, next_state_tensor).item()
+        # Asegurar dimensiones correctas
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
             
-            # Update max surprise for normalization
-            if prediction_error > self.max_surprise:
-                self.max_surprise = prediction_error
-                
-            # Normalize and store surprise
-            normalized_surprise = min(1.0, prediction_error / self.max_surprise)
-            self.surprise_history.append(normalized_surprise)
+        # Preparar acción
+        action_tensor = self._prepare_action_tensor(action)
+        if action_tensor.dim() == 1:
+            action_tensor = action_tensor.unsqueeze(0)
             
-            return normalized_surprise
-        except Exception as e:
-            print(f"Error en compute_surprise_reward: {e}")
-            # Fallback: retornar sorpresa media
-            return 0.5
+        # Preparar siguiente estado
+        if not torch.is_tensor(next_state):
+            next_state_tensor = torch.FloatTensor(next_state).to(self.device)
+        else:
+            next_state_tensor = next_state.to(self.device)
+            
+        if next_state_tensor.dim() == 1:
+            next_state_tensor = next_state_tensor.unsqueeze(0)
+        
+        # Concatenar estado y acción
+        model_input = torch.cat([state_tensor, action_tensor], dim=1)
+        
+        # Predecir siguiente estado
+        with torch.no_grad():
+            predicted_next_state = self.forward_model(model_input)
+        
+        # Calcular error de predicción (sorpresa)
+        prediction_error = F.mse_loss(predicted_next_state, next_state_tensor)
+        
+        # Convertir error a recompensa (mayor error = mayor sorpresa = mayor recompensa)
+        surprise_reward = torch.tanh(prediction_error).item()
+        
+        return surprise_reward
     
     def update_forward_model(self, state, action, next_state):
-        """Update the forward model to improve predictions"""
-        try:
-            # Convert to tensors
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action_onehot = self._prepare_action_tensor(action)
-            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+        """Actualiza el modelo predictivo basado en transiciones observadas"""
+        # Preparar datos
+        if not torch.is_tensor(state):
+            state_tensor = torch.FloatTensor(state).to(self.device)
+        else:
+            state_tensor = state.to(self.device)
             
-            # Training step
-            self.optimizer.zero_grad()
-            pred_input = torch.cat([state_tensor, action_onehot], dim=1)
-            predicted_next_state = self.forward_model(pred_input)
-            loss = F.mse_loss(predicted_next_state, next_state_tensor)
-            loss.backward()
-            self.optimizer.step()
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
             
-            return loss.item()
-        except Exception as e:
-            print(f"Error en update_forward_model: {e}")
-            return 0.0
+        action_tensor = self._prepare_action_tensor(action)
+        if action_tensor.dim() == 1:
+            action_tensor = action_tensor.unsqueeze(0)
+            
+        if not torch.is_tensor(next_state):
+            next_state_tensor = torch.FloatTensor(next_state).to(self.device)
+        else:
+            next_state_tensor = next_state.to(self.device)
+            
+        if next_state_tensor.dim() == 1:
+            next_state_tensor = next_state_tensor.unsqueeze(0)
+        
+        # Entrada del modelo
+        model_input = torch.cat([state_tensor, action_tensor], dim=1)
+        
+        # Entrenar modelo
+        self.optimizer.zero_grad()
+        predicted_next_state = self.forward_model(model_input)
+        loss = F.mse_loss(predicted_next_state, next_state_tensor)
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
     
     def compute_intrinsic_reward(self, state, action, next_state):
-        """Compute combined intrinsic reward"""
-        try:
-            novelty = self.compute_novelty_reward(state)
-            surprise = self.compute_surprise_reward(state, action, next_state)
-            
-            # Combined reward
-            intrinsic_reward = self.curiosity_weight * (0.5 * novelty + 0.5 * surprise)
-            
-            # Decay curiosity weight over time
-            self.curiosity_weight *= self.curiosity_decay
-            self.curiosity_weight = max(0.01, self.curiosity_weight)
-            
-            return intrinsic_reward
-        except Exception as e:
-            print(f"Error en compute_intrinsic_reward: {e}")
-            return 0.01  # Valor pequeño por defecto
+        """Combina recompensas de novedad y sorpresa"""
+        # Cada 100 llamadas, decaer contadores
+        if random.random() < 0.01:  # Aprox. cada 100 llamadas
+            self._decay_counts()
+        
+        # Calcular componentes de recompensa intrínseca
+        novelty = self.compute_novelty_reward(state)
+        surprise = self.compute_surprise_reward(state, action, next_state)
+        
+        # Combinar componentes
+        intrinsic_reward = (
+            self.novelty_weight * novelty + 
+            self.surprise_weight * surprise
+        )
+        
+        # Actualizar modelo forward
+        self.update_forward_model(state, action, next_state)
+        
+        # Aplicar peso global de curiosidad
+        return CURIOSITY_WEIGHT * intrinsic_reward
     
     def is_novel_state(self, state, threshold=NOVELTY_THRESHOLD):
-        """Check if a state is novel enough for exploration"""
-        try:
-            novelty = self.compute_novelty_reward(state)
-            return novelty > threshold
-        except Exception as e:
-            print(f"Error en is_novel_state: {e}")
-            return False
+        """Determina si un estado es suficientemente novedoso"""
+        state_hash = self.hash_state(state)
+        
+        # Si el estado no ha sido visto o ha sido visto pocas veces
+        if state_hash not in self.state_counts or self.state_counts[state_hash] < 3:
+            return True
+            
+        # Calcular novedad
+        count = self.state_counts[state_hash]
+        novelty = 1.0 / np.sqrt(count)
+        
+        return novelty > threshold
 
-# ------------------- Knowledge Transfer System -------------------
+# ------------------- Skill Library -------------------
 class SkillLibrary:
-    """Library of reusable skills learned during training"""
+    """Biblioteca de habilidades aprendidas que pueden ser reutilizadas"""
     def __init__(self, state_size, action_size, capacity=SKILL_LIBRARY_SIZE):
         self.state_size = state_size
         self.action_size = action_size
         self.capacity = capacity
-        
-        # Skill storage
-        self.skills = []
-        
-        # Skill prototypes - network snippets for different skills
-        self.skill_prototypes = {}
+        self.skills = {}  # Diccionario de habilidades
     
     def add_skill(self, skill_name, skill_network, skill_context, performance):
-        """Add a new skill to the library"""
-        # Check if we already have this skill
-        for skill in self.skills:
-            if skill['name'] == skill_name:
-                # Update existing skill if new one is better
-                if performance > skill['performance']:
-                    skill['network'] = skill_network
-                    skill['context'] = skill_context
-                    skill['performance'] = performance
-                    print(f"Updated skill '{skill_name}' (perf: {performance:.2f})")
-                return
+        """Añade una habilidad a la biblioteca"""
+        # Limitar tamaño de la biblioteca
+        if len(self.skills) >= self.capacity:
+            # Eliminar la habilidad con peor rendimiento
+            worst_skill = min(self.skills.items(), key=lambda x: x[1]['performance'])
+            del self.skills[worst_skill[0]]
         
-        # Add new skill if we have space
-        if len(self.skills) < self.capacity:
-            self.skills.append({
-                'name': skill_name,
-                'network': skill_network,
-                'context': skill_context,
-                'performance': performance,
-                'uses': 0
-            })
-            print(f"Added new skill '{skill_name}' to library (perf: {performance:.2f})")
-        else:
-            # Replace worst performing skill
-            worst_skill = min(self.skills, key=lambda x: x['performance'])
-            if performance > worst_skill['performance']:
-                worst_idx = self.skills.index(worst_skill)
-                self.skills[worst_idx] = {
-                    'name': skill_name,
-                    'network': skill_network,
-                    'context': skill_context,
-                    'performance': performance,
-                    'uses': 0
-                }
-                print(f"Replaced skill '{worst_skill['name']}' with '{skill_name}' (perf: {performance:.2f})")
+        # Almacenar la habilidad
+        self.skills[skill_name] = {
+            'network': skill_network.state_dict(),
+            'context': skill_context,
+            'performance': performance
+        }
+        
+        print(f"Habilidad '{skill_name}' añadida a la biblioteca con rendimiento {performance:.2f}")
+        return True
     
     def extract_navigation_skill(self, agent, env, performance):
-        """Extract navigation skill from agent's network"""
-        # Create a snapshot of the navigation module
-        navigation_state = copy.deepcopy(agent.modules['navigation'].state_dict())
+        """Extrae una habilidad específica de navegación"""
+        # Simplificado para demostración
+        if performance < 0.5:
+            return False  # Rendimiento insuficiente
         
-        # Store context about the environment
+        # Crear un contexto de habilidad
         context = {
             'difficulty': env.difficulty,
-            'avg_wall_density': self._calculate_wall_density(env),
-            'extracted_from_episode': agent.episodes_trained
+            'wall_density': self._calculate_wall_density(env),
+            'avg_path_length': performance * 10  # Estimación simple
         }
         
-        # Add to library
-        self.add_skill(f"navigation_diff{env.difficulty}", navigation_state, context, performance)
+        # Crear un nombre único para la habilidad
+        skill_name = f"nav_diff{env.difficulty}_perf{performance:.2f}"
+        
+        # Extraer la red de navegación del agente
+        nav_network = agent.modules['navigation']
+        
+        # Añadir a la biblioteca
+        return self.add_skill(skill_name, nav_network, context, performance)
     
     def extract_food_seeking_skill(self, agent, env, performance):
-        """Extract food seeking skill from agent's network"""
-        # Create a snapshot of relevant modules
-        perception_state = copy.deepcopy(agent.modules['perception'].state_dict())
-        executive_state = copy.deepcopy(agent.modules['executive'].state_dict())
+        """Extrae una habilidad de búsqueda de comida"""
+        # Simplificado para demostración
+        if performance < 0.6:
+            return False  # Rendimiento insuficiente
         
-        # Combined network state
-        combined_state = {
-            'perception': perception_state,
-            'executive': executive_state
-        }
-        
-        # Store context
+        # Crear un contexto de habilidad
         context = {
             'difficulty': env.difficulty,
-            'extracted_from_episode': agent.episodes_trained
+            'food_eaten': int(performance * 10),
+            'efficiency': performance
         }
         
-        # Add to library
-        self.add_skill(f"food_seeking_diff{env.difficulty}", combined_state, context, performance)
+        # Crear un nombre único para la habilidad
+        skill_name = f"food_diff{env.difficulty}_perf{performance:.2f}"
+        
+        # Extraer la red ejecutiva del agente
+        exec_network = agent.modules['executive']
+        
+        # Añadir a la biblioteca
+        return self.add_skill(skill_name, exec_network, context, performance)
     
     def _calculate_wall_density(self, env):
-        """Calculate wall density in the environment"""
-        # Count walls
-        vertical_walls = sum(sum(row) for row in env.vertical_walls)
-        horizontal_walls = sum(sum(row) for row in env.horizontal_walls)
-        total_walls = vertical_walls + horizontal_walls
-        
-        # Calculate maximum possible walls
-        max_vertical = len(env.vertical_walls) * len(env.vertical_walls[0])
-        max_horizontal = len(env.horizontal_walls) * len(env.horizontal_walls[0])
-        max_walls = max_vertical + max_horizontal
-        
-        # Density ratio
-        return total_walls / max_walls
+        """Calcula la densidad de paredes en el entorno"""
+        # Implementación simplificada
+        try:
+            # Contar paredes en el mapa
+            wall_count = 0
+            for row in env.vertical_walls:
+                wall_count += sum(row)
+            for row in env.horizontal_walls:
+                wall_count += sum(row)
+            
+            # Calcular densidad
+            total_cells = env.GRID_WIDTH * env.GRID_HEIGHT
+            density = wall_count / (2 * total_cells)  # Normalizar
+            
+            return density
+        except:
+            # Si hay algún error, retornar un valor predeterminado
+            return 0.5
     
     def find_matching_skill(self, skill_type, context):
-        """Find a matching skill for the current context"""
-        matching_skills = []
+        """Encuentra una habilidad que coincida con el contexto dado"""
+        best_match = None
+        best_score = 0.0
         
-        for skill in self.skills:
-            if skill_type in skill['name']:
-                # Check context similarity
-                difficulty_match = skill['context']['difficulty'] == context['difficulty']
-                
-                # For navigation, also check wall density
-                if 'navigation' in skill_type and 'avg_wall_density' in skill['context']:
-                    density_diff = abs(skill['context']['avg_wall_density'] - context['avg_wall_density'])
-                    density_match = density_diff < 0.2  # Within 20% similarity
-                else:
-                    density_match = True
-                
-                if difficulty_match and density_match:
-                    matching_skills.append(skill)
-        
-        if not matching_skills:
-            return None
+        for name, skill in self.skills.items():
+            # Verificar si la habilidad es del tipo correcto
+            if skill_type not in name:
+                continue
             
-        # Return the best performing matching skill
-        best_skill = max(matching_skills, key=lambda x: x['performance'])
-        best_skill['uses'] += 1
-        return best_skill
+            # Calcular puntuación de coincidencia
+            match_score = 0.0
+            
+            if 'difficulty' in context and 'difficulty' in skill['context']:
+                # Mayor puntuación para misma dificultad
+                if context['difficulty'] == skill['context']['difficulty']:
+                    match_score += 0.5
+                else:
+                    diff_delta = abs(context['difficulty'] - skill['context']['difficulty'])
+                    match_score += 0.5 * (1 - min(1.0, diff_delta / 2))
+            
+            # Otras métricas de contexto específicas por tipo
+            if skill_type == 'nav' and 'wall_density' in context and 'wall_density' in skill['context']:
+                density_match = 1.0 - abs(context['wall_density'] - skill['context']['wall_density'])
+                match_score += 0.3 * density_match
+            
+            elif skill_type == 'food' and 'efficiency' in skill['context']:
+                # Preferir habilidades con alta eficiencia
+                match_score += 0.3 * skill['context']['efficiency']
+            
+            # Factor de rendimiento
+            match_score += 0.2 * skill['performance']
+            
+            # Actualizar mejor coincidencia
+            if match_score > best_score:
+                best_score = match_score
+                best_match = name
+        
+        if best_match and best_score > 0.6:  # Umbral mínimo de coincidencia
+            return best_match
+        return None
     
     def apply_skill(self, agent, skill_name, context):
-        """Apply a skill from the library to the agent"""
-        # Find the skill
-        matching_skill = None
-        for skill in self.skills:
-            if skill['name'] == skill_name:
-                matching_skill = skill
-                break
-                
-        if not matching_skill:
-            print(f"Skill '{skill_name}' not found in library")
+        """Aplica una habilidad almacenada al agente"""
+        if skill_name not in self.skills:
+            print(f"Habilidad '{skill_name}' no encontrada")
             return False
+        
+        skill = self.skills[skill_name]
+        
+        try:
+            # Determinar a qué módulo aplicar la habilidad
+            if 'nav' in skill_name:
+                target_module = 'navigation'
+            elif 'food' in skill_name:
+                target_module = 'executive'
+            else:
+                # Para otros tipos de habilidades
+                if 'network_type' in skill['context']:
+                    target_module = skill['context']['network_type']
+                else:
+                    # Elegir basado en tamaño y estructura del state_dict
+                    # Simplificado: asumir ejecutivo
+                    target_module = 'executive'
             
-        # Check if context matches
-        if matching_skill['context']['difficulty'] != context['difficulty']:
-            print(f"Skill '{skill_name}' doesn't match current difficulty")
+            # Obtener el módulo objetivo
+            module = agent.modules[target_module]
+            
+            # Crear respaldo del estado actual
+            backup = copy.deepcopy(module.state_dict())
+            
+            # Aplicar la habilidad (mezcla de pesos)
+            current_state = module.state_dict()
+            
+            # Combinar pesos (75% habilidad, 25% actual)
+            with torch.no_grad():
+                for key in current_state:
+                    if key in skill['network']:
+                        # Verificar dimensiones
+                        if current_state[key].shape == skill['network'][key].shape:
+                            # Mezclar pesos
+                            skill_tensor = skill['network'][key].to(current_state[key].device)
+                            current_state[key] = 0.75 * skill_tensor + 0.25 * current_state[key]
+            
+            # Aplicar estado actualizado
+            module.load_state_dict(current_state)
+            
+            print(f"Habilidad '{skill_name}' aplicada a módulo '{target_module}'")
+            return True
+            
+        except Exception as e:
+            print(f"Error al aplicar habilidad '{skill_name}': {e}")
+            # En caso de error, intentar restaurar el estado anterior
+            if 'backup' in locals():
+                try:
+                    module.load_state_dict(backup)
+                    print("Restaurado estado anterior del módulo")
+                except:
+                    pass
             return False
-            
-        # Apply the skill
-        if 'navigation' in skill_name:
-            # Apply just to navigation module
-            agent.modules['navigation'].load_state_dict(matching_skill['network'])
-            print(f"Applied navigation skill '{skill_name}' to agent")
-        elif 'food_seeking' in skill_name:
-            # Apply to perception and executive
-            agent.modules['perception'].load_state_dict(matching_skill['network']['perception'])
-            agent.modules['executive'].load_state_dict(matching_skill['network']['executive'])
-            print(f"Applied food seeking skill '{skill_name}' to agent")
-        else:
-            print(f"Unknown skill type '{skill_name}'")
-            return False
-            
-        matching_skill['uses'] += 1
-        return True
     
     def create_skill_prototypes(self):
-        """Create prototype networks for different skills by averaging top performers"""
-        skill_types = ['navigation', 'food_seeking']
-        difficulties = [0, 1, 2]
+        """Crea prototipos para cada tipo de habilidad combinando habilidades existentes"""
+        # Agrupar habilidades por tipo
+        skill_types = {}
         
-        for skill_type in skill_types:
-            for diff in difficulties:
-                # Find all skills of this type and difficulty
-                matching_skills = [s for s in self.skills 
-                                 if skill_type in s['name'] and s['context']['difficulty'] == diff]
+        for name, skill in self.skills.items():
+            # Determinar tipo de habilidad por el nombre
+            if 'nav' in name:
+                skill_type = 'navigation'
+            elif 'food' in name:
+                skill_type = 'food_seeking'
+            else:
+                skill_type = 'general'
+            
+            if skill_type not in skill_types:
+                skill_types[skill_type] = []
+            
+            skill_types[skill_type].append((name, skill))
+        
+        # Crear prototipos para cada tipo
+        prototypes = {}
+        
+        for skill_type, skills in skill_types.items():
+            if len(skills) < 2:
+                continue  # Necesitamos al menos 2 habilidades para crear un prototipo
+            
+            # Ordenar por rendimiento
+            skills.sort(key=lambda x: x[1]['performance'], reverse=True)
+            
+            # Tomar las mejores habilidades (máximo 3)
+            best_skills = skills[:min(3, len(skills))]
+            
+            # Crear contexto promedio
+            avg_context = {}
+            for _, skill in best_skills:
+                for key, value in skill['context'].items():
+                    if isinstance(value, (int, float)):
+                        if key not in avg_context:
+                            avg_context[key] = 0
+                        avg_context[key] += value / len(best_skills)
+            
+            # Crear state_dict promedio
+            state_dicts = [s[1]['network'] for s in best_skills]
+            avg_state_dict = self._average_state_dicts(state_dicts)
+            
+            if avg_state_dict:
+                # Calcular rendimiento promedio
+                avg_performance = sum(s[1]['performance'] for s in best_skills) / len(best_skills)
                 
-                if len(matching_skills) >= 2:
-                    # Average the top 2 performers
-                    top_skills = sorted(matching_skills, key=lambda x: x['performance'], reverse=True)[:2]
-                    
-                    # Create prototype depending on skill type
-                    if skill_type == 'navigation':
-                        prototype = self._average_state_dicts([s['network'] for s in top_skills])
-                    else:  # food_seeking
-                        perception_dicts = [s['network']['perception'] for s in top_skills]
-                        executive_dicts = [s['network']['executive'] for s in top_skills]
-                        
-                        prototype = {
-                            'perception': self._average_state_dicts(perception_dicts),
-                            'executive': self._average_state_dicts(executive_dicts)
-                        }
-                    
-                    # Store prototype
-                    prototype_name = f"{skill_type}_diff{diff}_prototype"
-                    self.skill_prototypes[prototype_name] = {
-                        'network': prototype,
-                        'difficulty': diff,
-                        'performance': np.mean([s['performance'] for s in top_skills])
-                    }
-                    
-                    print(f"Created skill prototype '{prototype_name}'")
+                # Crear nombre para el prototipo
+                prototype_name = f"{skill_type}_prototype_p{avg_performance:.2f}"
+                
+                # Almacenar prototipo
+                prototypes[prototype_name] = {
+                    'network': avg_state_dict,
+                    'context': avg_context,
+                    'performance': avg_performance,
+                    'type': skill_type
+                }
+                
+                print(f"Creado prototipo '{prototype_name}' a partir de {len(best_skills)} habilidades")
+        
+        # Añadir prototipos a la biblioteca
+        for name, prototype in prototypes.items():
+            self.skills[name] = prototype
+        
+        return list(prototypes.keys())
     
     def _average_state_dicts(self, state_dicts):
-        """Average multiple state dictionaries together"""
+        """Promedia varios state_dicts con verificación de compatibilidad"""
         if not state_dicts:
             return None
-            
-        avg_dict = {}
-        for key in state_dicts[0].keys():
-            # Skip buffers that shouldn't be averaged
-            if 'activation_history' in key or 'usage_count' in key:
-                avg_dict[key] = state_dicts[0][key].clone()
-                continue
+        
+        # Usar el primer state_dict como referencia
+        result = {}
+        reference = state_dicts[0]
+        
+        try:
+            # Para cada clave en el state_dict de referencia
+            for key in reference:
+                # Verificar si todos los state_dicts tienen esta clave y dimensiones compatibles
+                compatible = all(
+                    key in sd and sd[key].shape == reference[key].shape
+                    for sd in state_dicts
+                )
                 
-            # Average parameter tensors
-            avg_dict[key] = sum(sd[key] for sd in state_dicts) / len(state_dicts)
-            
-        return avg_dict
+                if compatible:
+                    # Acumular tensores
+                    accumulated = torch.zeros_like(reference[key])
+                    for sd in state_dicts:
+                        accumulated += sd[key]
+                    
+                    # Calcular promedio
+                    result[key] = accumulated / len(state_dicts)
+                else:
+                    # Si no son compatibles, usar el valor del mejor (primero)
+                    result[key] = reference[key].clone()
+                    
+            return result
+        except Exception as e:
+            print(f"Error al promediar state_dicts: {e}")
+            return None
     
     def apply_prototype(self, agent, skill_type, difficulty):
-        """Apply a skill prototype to the agent"""
-        prototype_name = f"{skill_type}_diff{difficulty}_prototype"
+        """Aplica un prototipo de habilidad para una dificultad específica"""
+        # Buscar prototipo apropiado
+        prototype_name = None
         
-        if prototype_name not in self.skill_prototypes:
-            print(f"Prototype '{prototype_name}' not found")
+        for name in self.skills:
+            if skill_type in name and 'prototype' in name:
+                prototype_name = name
+                break
+        
+        if not prototype_name:
+            print(f"No se encontró prototipo para tipo '{skill_type}'")
             return False
-            
-        prototype = self.skill_prototypes[prototype_name]
         
-        # Apply prototype based on skill type
-        if skill_type == 'navigation':
-            agent.modules['navigation'].load_state_dict(prototype['network'])
-        elif skill_type == 'food_seeking':
-            agent.modules['perception'].load_state_dict(prototype['network']['perception'])
-            agent.modules['executive'].load_state_dict(prototype['network']['executive'])
+        # Crear contexto para la dificultad actual
+        context = {'difficulty': difficulty}
         
-        print(f"Applied skill prototype '{prototype_name}' to agent")
-        return True
+        # Aplicar prototipo
+        return self.apply_skill(agent, prototype_name, context)
 
+# ------------------- Concept Abstraction System -------------------
 class ConceptAbstraction:
-    """System for abstracting high-level concepts from experience"""
+    """Sistema para abstraer y generalizar conceptos de juego"""
     def __init__(self, state_size):
         self.state_size = state_size
         
-        # Abstract concepts
+        # Diccionario de conceptos
         self.concepts = {
-            'obstacle_avoidance': {
-                'examples': [],
-                'prototype': None,
-                'performance': 0.0
-            },
-            'food_seeking': {
-                'examples': [],
-                'prototype': None,
-                'performance': 0.0
-            },
-            'dead_end_detection': {
-                'examples': [],
-                'prototype': None,
-                'performance': 0.0
-            },
-            'corridor_navigation': {
-                'examples': [],
-                'prototype': None,
-                'performance': 0.0
-            }
+            'food': {'examples': [], 'prototype': None},
+            'wall': {'examples': [], 'prototype': None},
+            'self_collision': {'examples': [], 'prototype': None},
+            'open_space': {'examples': [], 'prototype': None}
         }
         
-        # Feature importance for each concept
-        self.feature_importance = {concept: np.zeros(state_size) for concept in self.concepts}
+        # Importancia de características para cada concepto
+        self.feature_importance = {
+            'food': torch.ones(state_size) / state_size,
+            'wall': torch.ones(state_size) / state_size,
+            'self_collision': torch.ones(state_size) / state_size,
+            'open_space': torch.ones(state_size) / state_size
+        }
         
-        # Concept recognizer - identifies which concept is relevant in a state
-        self.concept_recognizer = None
+        # Auto-encoder simple para extraer características
+        self.encoder = nn.Sequential(
+            nn.Linear(state_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16)
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, state_size)
+        )
+        
+        # Optimizer
+        self.optimizer = optim.Adam(
+            list(self.encoder.parameters()) + list(self.decoder.parameters()),
+            lr=0.001
+        )
     
     def add_example(self, concept, state, action, result):
-        """Add an example of a concept in action"""
+        """Añade un ejemplo de un concepto"""
         if concept not in self.concepts:
-            return
-            
-        # Store example
-        self.concepts[concept]['examples'].append({
-            'state': state,
-            'action': action,
-            'result': result  # Success or failure
-        })
+            self.concepts[concept] = {'examples': [], 'prototype': None}
+            self.feature_importance[concept] = torch.ones(self.state_size) / self.state_size
         
-        # Limit size
-        if len(self.concepts[concept]['examples']) > 100:
-            # Keep most recent examples
-            self.concepts[concept]['examples'] = self.concepts[concept]['examples'][-100:]
+        # Almacenar ejemplo
+        if torch.is_tensor(state):
+            state_tensor = state.detach().clone()
+        else:
+            state_tensor = torch.FloatTensor(state)
+        
+        # Limitar el número de ejemplos
+        max_examples = 100
+        if len(self.concepts[concept]['examples']) >= max_examples:
+            # Reemplazar un ejemplo aleatorio
+            idx = random.randint(0, max_examples - 1)
+            self.concepts[concept]['examples'][idx] = (state_tensor, action, result)
+        else:
+            self.concepts[concept]['examples'].append((state_tensor, action, result))
+        
+        # Actualizar prototipo si hay suficientes ejemplos
+        if len(self.concepts[concept]['examples']) >= 10:
+            self.update_feature_importance(concept)
+            self.create_concept_prototype(concept)
     
     def update_feature_importance(self, concept):
-        """Update feature importance for a concept based on examples"""
+        """Actualiza la importancia de características para el concepto"""
         if concept not in self.concepts or not self.concepts[concept]['examples']:
             return
-            
-        # Get successful examples
-        successful = [ex for ex in self.concepts[concept]['examples'] if ex['result'] == 'success']
-        failed = [ex for ex in self.concepts[concept]['examples'] if ex['result'] == 'failure']
         
-        if not successful or not failed:
-            return
-            
-        # Convert to arrays
-        successful_states = np.array([ex['state'] for ex in successful])
-        failed_states = np.array([ex['state'] for ex in failed])
+        examples = self.concepts[concept]['examples']
+        states = torch.stack([ex[0] for ex in examples])
         
-        # Calculate mean difference between successful and failed states
-        if len(successful_states) > 0 and len(failed_states) > 0:
-            successful_mean = np.mean(successful_states, axis=0)
-            failed_mean = np.mean(failed_states, axis=0)
+        # Calcular varianza de cada característica
+        variances = torch.var(states, dim=0)
+        
+        # Alta varianza → baja importancia; baja varianza → alta importancia
+        # Porque características con baja varianza son más consistentes para el concepto
+        importance = 1.0 / (variances + 1e-6)
+        
+        # Normalizar
+        importance = importance / importance.sum()
+        
+        # Actualizar importancia con suavizado
+        self.feature_importance[concept] = 0.8 * self.feature_importance[concept] + 0.2 * importance
+        
+        # Reentrenar autoencoder
+        for _ in range(5):  # Número reducido de epochs
+            self.optimizer.zero_grad()
             
-            # Features with larger differences are more important for this concept
-            importance = np.abs(successful_mean - failed_mean)
+            # Forward pass con ponderación de características
+            weighted_states = states * self.feature_importance[concept].unsqueeze(0)
+            encoded = self.encoder(weighted_states)
+            decoded = self.decoder(encoded)
             
-            # Normalize
-            if np.sum(importance) > 0:
-                importance = importance / np.sum(importance)
-                
-            self.feature_importance[concept] = importance
+            # Loss
+            loss = F.mse_loss(decoded, states)
+            loss.backward()
+            self.optimizer.step()
     
     def create_concept_prototype(self, concept):
-        """Create a prototype for a concept based on successful examples"""
-        if concept not in self.concepts:
-            return
-            
-        # Get successful examples
-        successful = [ex for ex in self.concepts[concept]['examples'] if ex['result'] == 'success']
+        """Crea un prototipo para un concepto basado en los ejemplos"""
+        if concept not in self.concepts or not self.concepts[concept]['examples']:
+            return None
         
-        if not successful:
-            return
-            
-        # Create prototype by averaging successful states
-        states = np.array([ex['state'] for ex in successful])
-        prototype = np.mean(states, axis=0)
+        examples = self.concepts[concept]['examples']
+        states = torch.stack([ex[0] for ex in examples])
         
-        # Store prototype
+        # Ponderar características por importancia
+        weighted_states = states * self.feature_importance[concept].unsqueeze(0)
+        
+        # Calcular prototipo como el estado promedio
+        prototype = torch.mean(weighted_states, dim=0)
+        
+        # Almacenar prototipo
         self.concepts[concept]['prototype'] = prototype
         
-        # Calculate performance - ratio of successful examples
-        total = len(self.concepts[concept]['examples'])
-        success_count = len(successful)
-        if total > 0:
-            self.concepts[concept]['performance'] = success_count / total
+        return prototype
     
     def identify_relevant_concept(self, state):
-        """Identify which concept is most relevant for a given state"""
-        if not any(c['prototype'] is not None for c in self.concepts.values()):
-            return None
-            
-        # Calculate similarity to each concept prototype
-        similarities = {}
+        """Identifica qué concepto es más relevante para el estado actual"""
+        if torch.is_tensor(state):
+            state_tensor = state.detach()
+        else:
+            state_tensor = torch.FloatTensor(state)
+        
+        best_concept = None
+        best_similarity = -1.0
+        
         for concept, data in self.concepts.items():
             if data['prototype'] is not None:
-                # Weight state features by importance for this concept
-                weighted_state = np.array(state) * self.feature_importance[concept]
+                # Ponderar tanto el estado como el prototipo
+                weighted_state = state_tensor * self.feature_importance[concept]
                 weighted_prototype = data['prototype'] * self.feature_importance[concept]
                 
-                # Calculate similarity
-                similarity = 1.0 - np.mean(np.abs(weighted_state - weighted_prototype))
-                similarities[concept] = similarity
+                # Calcular similitud coseno
+                similarity = F.cosine_similarity(
+                    weighted_state.view(1, -1),
+                    weighted_prototype.view(1, -1)
+                ).item()
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_concept = concept
         
-        if not similarities:
-            return None
-            
-        # Return most similar concept
-        return max(similarities.items(), key=lambda x: x[1])
+        # Solo retornar si la similitud es suficiente
+        if best_similarity > 0.7:
+            return best_concept, best_similarity
+        return None, 0.0
     
     def get_concept_embedding(self, concept):
-        """Get a compact embedding representing a concept"""
+        """Obtiene una representación compacta (embedding) del concepto"""
         if concept not in self.concepts or self.concepts[concept]['prototype'] is None:
             return None
-            
-        # Create compact embedding by keeping only the most important features
-        importance = self.feature_importance[concept]
         
-        # Get indices of 5 most important features
-        top_indices = np.argsort(importance)[-5:]
+        # Usar el encoder para obtener una representación compacta
+        with torch.no_grad():
+            prototype = self.concepts[concept]['prototype']
+            weighted_prototype = prototype * self.feature_importance[concept]
+            embedding = self.encoder(weighted_prototype.unsqueeze(0))
         
-        # Create embedding with just these features
-        prototype = self.concepts[concept]['prototype']
-        embedding = {i: prototype[i] for i in top_indices}
-        
-        return embedding
+        return embedding.squeeze(0)
 
-# ------------------- Advanced Neural Agent -------------------
+# ------------------- Meta-Learning System -------------------
+
 class ModularAdvancedAgent:
     """Main agent class integrating all advanced neural systems"""
     def __init__(self, state_size, action_size):
@@ -2052,6 +2277,29 @@ class ModularAdvancedAgent:
             'executive': ExecutiveModule(perception_out_size, navigation_out_size, 
                                        prediction_out_size, self.action_size).to(self.device)
         }
+        
+        # Configurar los listeners para propagar cambios de tamaño entre módulos
+        self._setup_size_change_listeners()
+    
+    def _setup_size_change_listeners(self):
+        """Configura listeners para propagar cambios de tamaño entre módulos"""
+        # Cuando el tamaño de salida de percepción cambia, actualizar navegación y ejecutivo
+        perception = self.modules['perception']
+        navigation = self.modules['navigation']
+        executive = self.modules['executive']
+        
+        # Registrar listeners para cambios en el módulo de percepción
+        perception.register_output_size_listener(
+            lambda old_size, new_size: navigation.handle_input_size_change(old_size, new_size, 0)
+        )
+        perception.register_output_size_listener(
+            lambda old_size, new_size: executive.handle_perception_size_change(old_size, new_size)
+        )
+        
+        # Registrar listeners para cambios en el módulo de navegación
+        navigation.register_output_size_listener(
+            lambda old_size, new_size: executive.handle_navigation_size_change(old_size, new_size)
+        )
     
     def setup_optimizer(self):
         """Setup optimizer with all trainable parameters"""
@@ -2480,8 +2728,21 @@ class ModularAdvancedAgent:
         if not batch:
             return 0
         
-        # Unpack batch
-        states, actions, rewards, next_states, dones = zip(*batch)
+        # Verificar la estructura del lote para evitar errores de descompresión
+        valid_batch = []
+        for transition in batch:
+            # Verificar que cada elemento del lote tenga exactamente 5 elementos
+            if isinstance(transition, tuple) and len(transition) == 5:
+                valid_batch.append(transition)
+            else:
+                print(f"Advertencia: Elemento de lote inválido detectado: {transition}")
+        
+        if not valid_batch:
+            print("Error: No hay elementos válidos en el lote.")
+            return 0
+        
+        # Unpack batch usando solo los elementos válidos
+        states, actions, rewards, next_states, dones = zip(*valid_batch)
         
         # Procesar batch de manera segura
         result = self.process_batch_safely(states, actions, rewards, next_states, dones)
@@ -2672,13 +2933,25 @@ class ModularAdvancedAgent:
         """Load the agent's state"""
         state = torch.load(filename, map_location=self.device)
         
-        # Load modules
+        # Primero, ajustar las dimensiones de las capas dinámicas
+        self._adapt_dynamic_layers_to_state(state)
+        
+        # Ahora cargar los módulos con las dimensiones ya ajustadas
         for name, module_state in state['modules'].items():
             if name in self.modules:
-                self.modules[name].load_state_dict(module_state)
+                try:
+                    self.modules[name].load_state_dict(module_state)
+                except Exception as e:
+                    print(f"Error al cargar el estado del módulo {name}: {e}")
+                    # Si todavía hay error, intentar una carga parcial
+                    self._partial_load_module(self.modules[name], module_state)
         
         # Load optimizer
-        self.optimizer.load_state_dict(state['optimizer'])
+        try:
+            self.optimizer.load_state_dict(state['optimizer'])
+        except Exception as e:
+            print(f"Error al cargar el optimizer, reconstruyendo: {e}")
+            self.setup_optimizer()
         
         # Load other attributes
         self.epsilon = state['epsilon']
@@ -2703,8 +2976,302 @@ class ModularAdvancedAgent:
             self.meta_controller.curriculum_level = state['meta_controller']['curriculum_level']
             self.meta_controller.current_strategy = state['meta_controller']['strategy']
         
-        print(f"Agent loaded from {filename}")
+        print(f"Agente cargado desde {filename}")
         return self.episodes_trained
+    
+    def _adapt_dynamic_layers_to_state(self, state):
+        """Ajusta las dimensiones de las capas dinámicas para que coincidan con el estado guardado"""
+        print("Adaptando dimensiones de capas dinámicas al modelo guardado...")
+        
+        try:
+            # 1. Ajustar PerceptionModule
+            if 'perception' in state['modules'] and 'perception' in self.modules:
+                perception_state = state['modules']['perception']
+                perception_module = self.modules['perception']
+                
+                # Primera capa dinámica
+                if 'feature_extractor.0.weight' in perception_state:
+                    saved_shape = perception_state['feature_extractor.0.weight'].shape
+                    current_shape = perception_module.feature_extractor[0].weight.shape
+                    
+                    if saved_shape != current_shape:
+                        print(f"Adaptando primera capa de Percepción: {current_shape} -> {saved_shape}")
+                        # Crear nueva capa con dimensiones correctas
+                        new_layer = DynamicLayer(perception_module.input_size, saved_shape[0])
+                        new_layer.to(self.device)
+                        perception_module.feature_extractor[0] = new_layer
+                
+                # Segunda capa dinámica
+                if 'feature_extractor.2.weight' in perception_state:
+                    saved_shape = perception_state['feature_extractor.2.weight'].shape
+                    current_shape = perception_module.feature_extractor[2].weight.shape
+                    
+                    if saved_shape != current_shape:
+                        print(f"Adaptando segunda capa de Percepción: {current_shape} -> {saved_shape}")
+                        first_layer_output = perception_module.feature_extractor[0].current_output_size
+                        new_layer = DynamicLayer(first_layer_output, saved_shape[0])
+                        new_layer.to(self.device)
+                        perception_module.feature_extractor[2] = new_layer
+                
+                # Actualizar output_size y atención
+                if 'feature_extractor.2.weight' in perception_state:
+                    new_output_size = perception_state['feature_extractor.2.weight'].shape[0]
+                    perception_module.output_size = new_output_size
+                    
+                    if 'attention' in perception_state:
+                        attention_shape = perception_state['attention'].shape
+                        if attention_shape != perception_module.attention.shape:
+                            new_attention = torch.ones(new_output_size, device=self.device) / new_output_size
+                            perception_module.attention = nn.Parameter(new_attention)
+            
+            # 2. Ajustar NavigationModule
+            if 'navigation' in state['modules'] and 'navigation' in self.modules:
+                navigation_state = state['modules']['navigation']
+                navigation_module = self.modules['navigation']
+                
+                # Actualizar dimensiones de las capas
+                layers_to_check = [
+                    ('pathfinder.0.weight', 0),
+                    ('pathfinder.2.weight', 2),
+                    ('pathfinder.4.weight', 4)
+                ]
+                
+                for key, idx in layers_to_check:
+                    if key in navigation_state:
+                        saved_shape = navigation_state[key].shape
+                        current_shape = navigation_module.pathfinder[idx].weight.shape
+                        
+                        if saved_shape != current_shape:
+                            print(f"Adaptando capa {idx} de Navegación: {current_shape} -> {saved_shape}")
+                            
+                            # Determinar tamaños de entrada
+                            if idx == 0:
+                                input_size = navigation_module.input_size
+                            elif idx == 2:
+                                input_size = navigation_module.pathfinder[0].current_output_size
+                            elif idx == 4:
+                                input_size = navigation_module.pathfinder[2].current_output_size
+                            
+                            # Crear nueva capa
+                            new_layer = DynamicLayer(input_size, saved_shape[0])
+                            new_layer.to(self.device)
+                            navigation_module.pathfinder[idx] = new_layer
+                
+                # Actualizar output_size y direction_bias
+                if 'pathfinder.4.weight' in navigation_state:
+                    new_output_size = navigation_state['pathfinder.4.weight'].shape[0]
+                    navigation_module.output_size = new_output_size
+                    
+                    if 'direction_bias' in navigation_state:
+                        bias_shape = navigation_state['direction_bias'].shape
+                        if bias_shape != navigation_module.direction_bias.shape:
+                            new_bias = torch.zeros(new_output_size, device=self.device)
+                            navigation_module.direction_bias = nn.Parameter(new_bias)
+            
+            # 3. Ajustar ExecutiveModule
+            if 'executive' in state['modules'] and 'executive' in self.modules:
+                executive_state = state['modules']['executive']
+                executive_module = self.modules['executive']
+                
+                # Actualizar dimensiones del integrador
+                layers_to_check = [
+                    ('integrator.0.weight', 0),
+                    ('integrator.2.weight', 2)
+                ]
+                
+                for key, idx in layers_to_check:
+                    if key in executive_state:
+                        saved_shape = executive_state[key].shape
+                        current_shape = executive_module.integrator[idx].weight.shape
+                        
+                        if saved_shape != current_shape:
+                            print(f"Adaptando capa {idx} de Ejecutivo: {current_shape} -> {saved_shape}")
+                            
+                            # Determinar tamaños de entrada
+                            if idx == 0:
+                                input_size = saved_shape[1]  # Usar el tamaño guardado
+                                # Actualizar las dimensiones combinadas
+                                combined_size = executive_module.perception_size + executive_module.navigation_size + executive_module.prediction_size
+                                if combined_size != input_size:
+                                    print(f"Advertencia: Discrepancia en tamaño de entrada combinado: {combined_size} (actual) vs {input_size} (guardado)")
+                            elif idx == 2:
+                                input_size = executive_module.integrator[0].current_output_size
+                            
+                            # Crear nueva capa
+                            new_layer = DynamicLayer(input_size, saved_shape[0])
+                            new_layer.to(self.device)
+                            executive_module.integrator[idx] = new_layer
+                
+                # Actualizar action_selector
+                if 'action_selector.weight' in executive_state:
+                    saved_shape = executive_state['action_selector.weight'].shape
+                    current_shape = executive_module.action_selector.weight.shape
+                    
+                    if saved_shape != current_shape:
+                        print(f"Adaptando selector de acciones: {current_shape} -> {saved_shape}")
+                        # El tamaño de entrada debe coincidir con la salida de la última capa del integrador
+                        input_size = executive_module.integrator[2].current_output_size
+                        new_layer = DynamicLayer(input_size, executive_module.action_size)
+                        new_layer.to(self.device)
+                        executive_module.action_selector = new_layer
+            
+            # 4. Ajustar PredictionModule si es necesario
+            # (similar a los anteriores, depende de la estructura exacta)
+            
+        except Exception as e:
+            print(f"Error durante la adaptación de dimensiones: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Reconfiguramos los listeners para mantener la sincronización
+        self._setup_size_change_listeners()
+        print("Adaptación de dimensiones completada")
+    
+    def _adapt_module_dynamic_layers(self, module, module_state):
+        """Recorre el módulo buscando capas dinámicas y ajusta sus dimensiones"""
+        # Para manejar módulos tipo Sequential
+        if isinstance(module, nn.Sequential):
+            for i, layer in enumerate(module):
+                layer_key = f"{i}"
+                if isinstance(layer, DynamicLayer):
+                    # Buscar las dimensiones correspondientes en el state_dict
+                    weight_key = f"{layer_key}.weight"
+                    if weight_key in module_state:
+                        saved_shape = module_state[weight_key].shape
+                        current_shape = layer.weight.shape
+                        
+                        if saved_shape != current_shape:
+                            print(f"  Ajustando capa: {saved_shape} (guardada) -> {current_shape} (actual)")
+                            # Calcular cuánto debe crecer la capa
+                            growth_neurons = saved_shape[0] - current_shape[0]
+                            
+                            if growth_neurons > 0:
+                                # Hacer crecer la capa manualmente, similar a grow_neurons pero sin las verificaciones
+                                with torch.no_grad():
+                                    # Crear nuevos tensores con las dimensiones apropiadas
+                                    new_weight = torch.zeros(saved_shape, device=layer.weight.device)
+                                    new_bias = torch.zeros(saved_shape[0], device=layer.bias.device)
+                                    
+                                    # Copiar los pesos y bias existentes
+                                    new_weight[:current_shape[0], :] = layer.weight
+                                    new_bias[:current_shape[0]] = layer.bias
+                                    
+                                    # Inicializar aleatoriamente las nuevas neuronas
+                                    new_weight[current_shape[0]:, :] = 0.01 * torch.randn(
+                                        growth_neurons, saved_shape[1], device=layer.weight.device)
+                                    
+                                    # Asignar los nuevos pesos y bias
+                                    layer.weight = nn.Parameter(new_weight)
+                                    layer.bias = nn.Parameter(new_bias)
+                                    
+                                    # Actualizar buffers necesarios con nuevas dimensiones
+                                    for buffer_name, buffer in list(layer._buffers.items()):
+                                        if buffer is not None:
+                                            buffer_shape = buffer.shape
+                                            
+                                            # Determinar las nuevas dimensiones del buffer
+                                            if len(buffer_shape) == 1 and buffer_shape[0] == current_shape[0]:
+                                                # Buffers 1D como activation_history, usage_count
+                                                new_buffer = torch.zeros(saved_shape[0], device=buffer.device)
+                                                new_buffer[:current_shape[0]] = buffer
+                                            elif len(buffer_shape) == 2 and buffer_shape[0] == current_shape[0]:
+                                                # Buffers 2D como connection_activity, hebbian_traces
+                                                new_buffer = torch.zeros(saved_shape, device=buffer.device)
+                                                new_buffer[:current_shape[0], :] = buffer
+                                            else:
+                                                # Mantener el buffer original
+                                                continue
+                                                
+                                            # Actualizar el buffer
+                                            layer.register_buffer(buffer_name, new_buffer)
+                                    
+                                    # Actualizar el tamaño actual
+                                    layer.current_output_size = saved_shape[0]
+                                    print(f"    Capa redimensionada a {saved_shape[0]} neuronas")
+                
+                # Procesar recursivamente las sublayers si las hay
+                if hasattr(layer, "_adapt_module_dynamic_layers"):
+                    sub_state = {k.split('.', 1)[1]: v for k, v in module_state.items() 
+                               if k.startswith(f"{layer_key}.") and len(k.split('.')) > 1}
+                    layer._adapt_module_dynamic_layers(layer, sub_state)
+        
+        # Manejar atributos específicos que son capas dinámicas
+        for name, child in module.__dict__.items():
+            if isinstance(child, DynamicLayer):
+                # Buscar claves que correspondan a este atributo
+                weight_key = f"{name}.weight"
+                attribute_prefix = f"{name}."
+                
+                sub_state = {k: v for k, v in module_state.items() if k.startswith(attribute_prefix)}
+                
+                if weight_key in module_state:
+                    saved_shape = module_state[weight_key].shape
+                    current_shape = child.weight.shape
+                    
+                    if saved_shape != current_shape:
+                        print(f"  Ajustando capa {name}: {saved_shape} (guardada) -> {current_shape} (actual)")
+                        # Calcular cuánto debe crecer la capa
+                        growth_neurons = saved_shape[0] - current_shape[0]
+                        
+                        if growth_neurons > 0:
+                            # Hacer crecer la capa manualmente
+                            with torch.no_grad():
+                                # Crear nuevos tensores con las dimensiones apropiadas
+                                new_weight = torch.zeros(saved_shape, device=child.weight.device)
+                                new_bias = torch.zeros(saved_shape[0], device=child.bias.device)
+                                
+                                # Copiar los pesos y bias existentes
+                                new_weight[:current_shape[0], :] = child.weight
+                                new_bias[:current_shape[0]] = child.bias
+                                
+                                # Inicializar aleatoriamente las nuevas neuronas
+                                new_weight[current_shape[0]:, :] = 0.01 * torch.randn(
+                                    growth_neurons, saved_shape[1], device=child.weight.device)
+                                
+                                # Asignar los nuevos pesos y bias
+                                child.weight = nn.Parameter(new_weight)
+                                child.bias = nn.Parameter(new_bias)
+                                
+                                # Actualizar buffers necesarios con nuevas dimensiones
+                                for buffer_name, buffer in list(child._buffers.items()):
+                                    if buffer is not None:
+                                        buffer_shape = buffer.shape
+                                        
+                                        # Determinar las nuevas dimensiones del buffer
+                                        if len(buffer_shape) == 1 and buffer_shape[0] == current_shape[0]:
+                                            # Buffers 1D como activation_history, usage_count
+                                            new_buffer = torch.zeros(saved_shape[0], device=buffer.device)
+                                            new_buffer[:current_shape[0]] = buffer
+                                        elif len(buffer_shape) == 2 and buffer_shape[0] == current_shape[0]:
+                                            # Buffers 2D como connection_activity, hebbian_traces
+                                            new_buffer = torch.zeros(saved_shape, device=buffer.device)
+                                            new_buffer[:current_shape[0], :] = buffer
+                                        else:
+                                            # Mantener el buffer original
+                                            continue
+                                            
+                                        # Actualizar el buffer
+                                        child.register_buffer(buffer_name, new_buffer)
+                                
+                                # Actualizar el tamaño actual
+                                child.current_output_size = saved_shape[0]
+                                print(f"    Capa redimensionada a {saved_shape[0]} neuronas")
+    
+    def _partial_load_module(self, module, state_dict):
+        """Intenta cargar parcialmente un módulo, excluyendo parámetros con discrepancia de tamaño"""
+        print(f"Intentando carga parcial para {type(module).__name__}")
+        own_state = module.state_dict()
+        
+        for name, param in state_dict.items():
+            if name in own_state:
+                try:
+                    if isinstance(param, torch.nn.Parameter):
+                        param = param.data
+                    own_state[name].copy_(param)
+                except Exception as e:
+                    print(f"  Saltando parámetro {name}: {e}")
+        
+        print("Carga parcial completada")
 
 # ------------------- Integration Helper Functions -------------------
 def create_advanced_agent(state_size, action_size):
@@ -2917,15 +3484,35 @@ def visualize_dynamic_growth(agent, output_file="neural_growth.png"):
         return False
 
 # ------------------- Función de Integración -------------------
-def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
+def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth", load_existing=True, difficulty=0):
     """Integra el agente neuronal avanzado con el entorno SnakeRL y lo entrena."""
+    import os
     from SnakeRL import SnakeGame  # Importar el entorno desde SnakeRL.py
-    env = SnakeGame(render=True, difficulty=0)  # Puedes ajustar la dificultad
+    env = SnakeGame(render=True, difficulty=difficulty)  # Usar el parámetro de dificultad
     
     state_size = len(env._get_state())  # Obtener el tamaño del estado
     action_size = 3  # Acciones: 0 (recto), 1 (izquierda), 2 (derecha)
     
+    # Crear un nuevo agente
     agent = create_advanced_agent(state_size, action_size)
+    
+    # Cargar el agente existente si se especifica
+    episodes_completed = 0
+    if load_existing and os.path.exists(save_path):
+        print(f"Cargando agente existente desde {save_path}")
+        try:
+            episodes_completed = load_advanced_agent(agent, save_path)
+            print(f"Continuando entrenamiento desde el episodio {episodes_completed}")
+        except Exception as e:
+            print(f"Error al cargar agente desde {save_path}: {e}")
+            print("Usando un agente nuevo en su lugar.")
+            # Reiniciar agente
+            agent = create_advanced_agent(state_size, action_size)
+    else:
+        if load_existing and not os.path.exists(save_path):
+            print(f"No se encontró el archivo del modelo {save_path}. Iniciando con un agente nuevo.")
+        else:
+            print("Iniciando entrenamiento con un agente nuevo")
     
     # OPTIMIZACIÓN: Verificar uso de GPU
     check_gpu_compatibility()
@@ -2998,89 +3585,698 @@ def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Guardar el agente entren
-def integrate_with_snakeRL(episodes=1000, save_path="snake_agent.pth"):
-    """Integra el agente neuronal avanzado con el entorno SnakeRL y lo entrena."""
-    from SnakeRL import SnakeGame  # Importar el entorno desde SnakeRL.py
-    env = SnakeGame(render=True, difficulty=0)  # Puedes ajustar la dificultad
+        print("Limpieza de recursos completada")
+
+# ------------------- Simplified Episode and Memory Classes -------------------
+class Episode:
+    """Representa un episodio de juego con transiciones"""
+    def __init__(self, max_length=1000):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.next_states = []
+        self.dones = []
+        self.importance = 1.0  # Importancia predeterminada
+        self.max_length = max_length
     
-    state_size = len(env._get_state())  # Obtener el tamaño del estado
-    action_size = 3  # Acciones: 0 (recto), 1 (izquierda), 2 (derecha)
-    
-    agent = create_advanced_agent(state_size, action_size)
-    
-    # OPTIMIZACIÓN: Verificar uso de GPU
-    check_gpu_compatibility()
-    
-    # Crear gestor de memoria
-    memory_manager = MemoryManager(agent)
-    
-    try:
-        for episode in range(episodes):
-            state = env.reset()
-            done = False
-            total_reward = 0
-            episode_score = 0
-            steps = 0
-            
-            # Monitorear memoria al inicio del episodio
-            memory_manager.monitor_and_log()
-            
-            while not done:
-                action = get_action(agent, state)
-                next_state, reward, done = env.step(action)
-                combined_reward = process_state_action_reward(agent, state, action, reward, next_state, done)
-                
-                # Evitar entrenar en cada paso para reducir carga computacional
-                if steps % 3 == 0:  # Entrenar cada 3 pasos
-                    train_advanced_agent(agent)
-                
-                state = next_state
-                total_reward += combined_reward
-                if reward > 0:  # Suponiendo que reward > 0 indica que comió comida
-                    episode_score += 1
-                steps += 1
-                
-                # Renderizar el entorno
-                env.render(current_score=episode_score, total_score=agent.episodes_trained, 
-                       episodes_left=episodes - episode - 1, epsilon=agent.epsilon, 
-                       avg_q=np.mean(agent.q_values[-100:]) if agent.q_values else 0)
-                
-                # Manejar eventos para permitir salida manual
-                if not env.handle_events():
-                    print("Entrenamiento interrumpido por el usuario.")
-                    save_advanced_agent(agent, save_path)
-                    env.close()
-                    return
-            
-            # Actualizar después del episodio
-            update_after_episode(agent, env, total_reward, episode_score)
-            
-            # NUEVA OPTIMIZACIÓN: Limpieza después de cada episodio
-            memory_manager.after_episode_cleanup()
-            
-            # Imprimir progreso cada 10 episodios
-            if (episode + 1) % 10 == 0:
-                print(f"Episodio {episode + 1}/{episodes} - Score: {episode_score} - Reward: {total_reward:.2f} - Steps: {steps}")
-                
-                # Guardar checkpoint cada 50 episodios
-                if (episode + 1) % 50 == 0:
-                    save_advanced_agent(agent, f"{save_path}.checkpoint")
+    def add(self, state, action, reward, next_state, done):
+        """Añade una transición al episodio"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.next_states.append(next_state)
+        self.dones.append(done)
         
-        # Guardar el agente entrenado
-        save_advanced_agent(agent, save_path)
-        print(f"Entrenamiento completado. Agente guardado en {save_path}")
+        # Mantener tamaño máximo
+        if len(self.states) > self.max_length:
+            self.states.pop(0)
+            self.actions.pop(0)
+            self.rewards.pop(0)
+            self.next_states.pop(0)
+            self.dones.pop(0)
+    
+    def calculate_importance(self):
+        """Calcula la importancia del episodio basado en las recompensas"""
+        if not self.rewards:
+            return 0.0
         
-    finally:
-        # Asegurar que se liberen los recursos
-        env.close()
+        # Importancia basada en recompensa total y máxima
+        total_reward = sum(self.rewards)
+        max_reward = max(self.rewards) if self.rewards else 0
         
-        # Limpieza final de memoria
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Combinar factores para calcular importancia
+        self.importance = 0.7 * total_reward + 0.3 * max_reward
+        return self.importance
+    
+    def get_transitions(self):
+        """Devuelve todas las transiciones del episodio"""
+        return list(zip(self.states, self.actions, self.rewards, self.next_states, self.dones))
+    
+    def get_random_batch(self, batch_size):
+        """Devuelve un lote aleatorio de transiciones"""
+        if not self.states or batch_size <= 0:
+            return [], [], [], [], []
+        
+        indices = np.random.choice(len(self.states), min(batch_size, len(self.states)), replace=False)
+        
+        return (
+            [self.states[i] for i in indices],
+            [self.actions[i] for i in indices],
+            [self.rewards[i] for i in indices],
+            [self.next_states[i] for i in indices],
+            [self.dones[i] for i in indices]
+        )
+    
+    def get_sequence(self, start_idx, length):
+        """Devuelve una secuencia de transiciones a partir del índice dado"""
+        end_idx = min(start_idx + length, len(self.states))
+        return (
+            self.states[start_idx:end_idx],
+            self.actions[start_idx:end_idx],
+            self.rewards[start_idx:end_idx],
+            self.next_states[start_idx:end_idx],
+            self.dones[start_idx:end_idx]
+        )
+
+class EpisodicMemory:
+    """Memoria de episodios con muestreo basado en importancia"""
+    def __init__(self, capacity=100):
+        self.episodes = []
+        self.capacity = capacity
+        self.current_episode = Episode()
+        
+        # Variables para el análisis causal
+        self.causal_patterns = {}
+        self.state_visit_counts = {}
+    
+    def add(self, state, action, reward, next_state, done):
+        """Añade una transición a la memoria"""
+        # Añadir a episodio actual
+        self.current_episode.add(state, action, reward, next_state, done)
+        
+        # Actualizar contadores de visita de estados
+        state_key = self._get_state_key(state)
+        self.state_visit_counts[state_key] = self.state_visit_counts.get(state_key, 0) + 1
+    
+    def end_episode(self):
+        """Finaliza el episodio actual y lo almacena en memoria"""
+        # Solo almacenar episodios no vacíos
+        if len(self.current_episode.states) > 0:
+            # Calcular importancia
+            self.current_episode.calculate_importance()
+            
+            # Analizar patrones causales
+            self._analyze_causal_patterns(self.current_episode)
+            
+            # Añadir a la lista de episodios
+            self.episodes.append(self.current_episode)
+            
+            # Mantener capacidad
+            if len(self.episodes) > self.capacity:
+                # Eliminar episodio menos importante
+                min_idx = min(range(len(self.episodes)), key=lambda i: self.episodes[i].importance)
+                self.episodes.pop(min_idx)
+            
+            # Consolidar patrones causales periódicamente
+            if len(self.episodes) % 10 == 0:
+                self._consolidate_causal_patterns()
+        
+        # Crear nuevo episodio
+        self.current_episode = Episode()
+    
+    def _analyze_causal_patterns(self, episode):
+        """Analiza patrones causales en el episodio"""
+        # Versión simplificada para identificar acciones que llevaron a recompensas
+        for i in range(len(episode.states) - 1):
+            if episode.rewards[i] > 0:
+                # Identificar estados y acciones que llevaron a recompensas
+                state_key = self._get_state_key(episode.states[i])
+                action = episode.actions[i]
+                
+                # Registrar en patrones causales
+                if state_key not in self.causal_patterns:
+                    self.causal_patterns[state_key] = {}
+                
+                if action not in self.causal_patterns[state_key]:
+                    self.causal_patterns[state_key][action] = {
+                        'count': 0,
+                        'reward': 0.0
+                    }
+                
+                self.causal_patterns[state_key][action]['count'] += 1
+                self.causal_patterns[state_key][action]['reward'] += episode.rewards[i]
+    
+    def _consolidate_causal_patterns(self):
+        """Consolida patrones causales para reducir ruido"""
+        # Eliminar patrones poco frecuentes o con baja recompensa
+        keys_to_remove = []
+        
+        for state_key, actions in self.causal_patterns.items():
+            action_keys_to_remove = []
+            
+            for action, data in actions.items():
+                if data['count'] < 3 or data['reward'] / data['count'] < 0.2:
+                    action_keys_to_remove.append(action)
+            
+            for action in action_keys_to_remove:
+                del actions[action]
+            
+            if not actions:
+                keys_to_remove.append(state_key)
+        
+        for state_key in keys_to_remove:
+            del self.causal_patterns[state_key]
+    
+    def _calculate_state_similarity(self, state1, state2):
+        """Calcula la similitud entre dos estados"""
+        # Implementación simplificada
+        if not torch.is_tensor(state1):
+            state1 = torch.FloatTensor(state1)
+        if not torch.is_tensor(state2):
+            state2 = torch.FloatTensor(state2)
+            
+        # Asegurar misma dimensión
+        if state1.dim() != state2.dim():
+            if state1.dim() == 1:
+                state1 = state1.unsqueeze(0)
+            if state2.dim() == 1:
+                state2 = state2.unsqueeze(0)
+        
+        # Distancia coseno (mayor valor = más similar)
+        dot_product = torch.sum(state1 * state2)
+        norm1 = torch.norm(state1)
+        norm2 = torch.norm(state2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    def sample_batch(self, batch_size):
+        """Muestrea un lote de transiciones de la memoria"""
+        if not self.episodes:
+            return [], [], [], [], []
+            
+        # Seleccionar episodios con probabilidad proporcional a su importancia
+        episode_importances = [ep.importance for ep in self.episodes]
+        total_importance = sum(episode_importances)
+        
+        if total_importance <= 0:
+            # Si todas las importancias son cero, usar distribución uniforme
+            probs = None
+        else:
+            probs = [imp / total_importance for imp in episode_importances]
+        
+        # Muestrear episodios
+        sampled_episodes = np.random.choice(
+            self.episodes, 
+            min(len(self.episodes), batch_size // 10 + 1),
+            replace=False,
+            p=probs
+        )
+        
+        # Obtener transiciones de cada episodio
+        states, actions, rewards, next_states, dones = [], [], [], [], []
+        
+        transitions_per_episode = max(1, batch_size // len(sampled_episodes))
+        
+        for episode in sampled_episodes:
+            ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = episode.get_random_batch(transitions_per_episode)
+            
+            states.extend(ep_states)
+            actions.extend(ep_actions)
+            rewards.extend(ep_rewards)
+            next_states.extend(ep_next_states)
+            dones.extend(ep_dones)
+        
+        # Limitar al tamaño del lote
+        if len(states) > batch_size:
+            indices = np.random.choice(len(states), batch_size, replace=False)
+            states = [states[i] for i in indices]
+            actions = [actions[i] for i in indices]
+            rewards = [rewards[i] for i in indices]
+            next_states = [next_states[i] for i in indices]
+            dones = [dones[i] for i in indices]
+        
+        return states, actions, rewards, next_states, dones
+    
+    def sample_causal_batch(self, state, batch_size):
+        """Muestrea transiciones causalmente relacionadas con el estado dado"""
+        if not self.episodes or batch_size <= 0:
+            return self.sample_batch(batch_size)
+        
+        # Buscar estados similares
+        similar_transitions = []
+        
+        for episode in self.episodes:
+            for i, ep_state in enumerate(episode.states):
+                similarity = self._calculate_state_similarity(state, ep_state)
+                
+                if similarity > 0.8:  # Umbral de similitud
+                    similar_transitions.append((
+                        episode.states[i],
+                        episode.actions[i],
+                        episode.rewards[i],
+                        episode.next_states[i],
+                        episode.dones[i],
+                        similarity
+                    ))
+        
+        # Si no hay suficientes transiciones similares, completar con muestreo aleatorio
+        if len(similar_transitions) < batch_size:
+            regular_batch = self.sample_batch(batch_size - len(similar_transitions))
+            
+            # Combinar con transiciones similares
+            states = [t[0] for t in similar_transitions] + regular_batch[0]
+            actions = [t[1] for t in similar_transitions] + regular_batch[1]
+            rewards = [t[2] for t in similar_transitions] + regular_batch[2]
+            next_states = [t[3] for t in similar_transitions] + regular_batch[3]
+            dones = [t[4] for t in similar_transitions] + regular_batch[4]
+            
+            return states, actions, rewards, next_states, dones
+        
+        # Ordenar por similitud (mayor primero)
+        similar_transitions.sort(key=lambda x: x[5], reverse=True)
+        
+        # Tomar las más similares hasta el tamaño del lote
+        selected = similar_transitions[:batch_size]
+        
+        return (
+            [t[0] for t in selected],
+            [t[1] for t in selected],
+            [t[2] for t in selected],
+            [t[3] for t in selected],
+            [t[4] for t in selected]
+        )
+    
+    def perform_counterfactual_analysis(self, state, action, reward, next_state):
+        """Realiza análisis contrafactual para estimar el valor de acciones alternativas"""
+        # Versión simplificada
+        counterfactual_estimates = {}
+        
+        # Obtener clave de estado
+        state_key = self._get_state_key(state)
+        
+        # Buscar en patrones causales
+        if state_key in self.causal_patterns:
+            for alt_action, data in self.causal_patterns[state_key].items():
+                if alt_action != action and data['count'] > 0:
+                    # Estimar recompensa para acción alternativa
+                    counterfactual_estimates[alt_action] = data['reward'] / data['count']
+        
+        return counterfactual_estimates
+    
+    def _get_state_key(self, state):
+        """Obtiene una clave de hash para identificar estados similares"""
+        # Implementación simplificada
+        if torch.is_tensor(state):
+            # Redondear a primer decimal para agrupar estados similares
+            rounded = torch.round(state * 10) / 10
+            # Convertir a tupla para poder usar como clave de diccionario
+            return tuple(rounded.flatten().tolist())
+        else:
+            # Si no es tensor, convertir a tupla de valores redondeados
+            return tuple(round(x * 10) / 10 for x in np.array(state).flatten())
+
+# ------------------- Meta-Learning System -------------------
+
+class MetaController:
+    """Meta-learning system that optimizes hyperparameters and learning strategies"""
+    def __init__(self, agent, learning_rate=META_LEARNING_RATE):
+        self.agent = agent
+        self.learning_rate = learning_rate
+        
+        # Performance history
+        self.performance_history = deque(maxlen=100)
+        self.reward_history = deque(maxlen=100)
+        
+        # Hyperparameter ranges
+        self.hyper_ranges = {
+            'learning_rate': (0.0001, 0.01),
+            'gamma': (0.9, 0.999),
+            'epsilon_decay': (0.95, 0.999),
+            'batch_size': (32, 128)
+        }
+        
+        # Strategy options
+        self.strategies = ['exploit', 'explore', 'diversify']
+        self.current_strategy = 'explore'  # Start with exploration
+        
+        # Epsilon for hyperparameter adjustments
+        self.meta_epsilon = 1.0
+        self.meta_epsilon_decay = 0.99
+        
+        # Architecture modification state
+        self.architecture_frozen = False
+        
+        # Curriculum learning state
+        self.curriculum_level = 0
+        self.curriculum_performance = 0.0
+        self.curriculum_episodes = 0
+    
+    def record_performance(self, episode_reward, episode_score):
+        """Record performance metrics for an episode"""
+        self.performance_history.append(episode_score)
+        self.reward_history.append(episode_reward)
+    
+    def adjust_hyperparameters(self):
+        """Adjust hyperparameters based on recent performance"""
+        # Only adjust if we have enough history
+        if len(self.performance_history) < 10:
+            return
+        
+        # Determine if we're improving or declining
+        recent_perf = list(self.performance_history)[-10:]
+        if len(recent_perf) < 10:
+            return
+            
+        first_half = sum(recent_perf[:5]) / 5
+        second_half = sum(recent_perf[5:]) / 5
+        
+        # Calculate trend
+        performance_trend = (second_half - first_half) / max(1, first_half)
+        
+        # Decide whether to explore or exploit
+        if random.random() < self.meta_epsilon:
+            # Random exploration of hyperparameters
+            self._random_hyperparameter_adjustment()
+        else:
+            # Targeted adjustments based on performance trend
+            self._targeted_hyperparameter_adjustment(performance_trend)
+        
+        # Decay meta-epsilon
+        self.meta_epsilon *= self.meta_epsilon_decay
+        self.meta_epsilon = max(0.1, self.meta_epsilon)
+    
+    def _random_hyperparameter_adjustment(self):
+        """Make a random adjustment to one hyperparameter"""
+        # Select a random hyperparameter to adjust
+        param = random.choice(list(self.hyper_ranges.keys()))
+        
+        # Get current value and range
+        if param == 'learning_rate':
+            current = self.agent.learning_rate
+        elif param == 'gamma':
+            current = self.agent.gamma
+        elif param == 'epsilon_decay':
+            current = self.agent.epsilon_decay
+        elif param == 'batch_size':
+            current = self.agent.batch_size
+        
+        min_val, max_val = self.hyper_ranges[param]
+        
+        # Generate new value
+        if param == 'batch_size':
+            # Batch size should be an integer and a power of 2
+            options = [32, 64, 96, 128]
+            new_value = random.choice(options)
+        else:
+            # Random adjustment within range
+            adjustment = (random.random() - 0.5) * 0.2  # ±10% adjustment
+            new_value = current * (1 + adjustment)
+            new_value = max(min_val, min(max_val, new_value))
+        
+        # Apply new value
+        if param == 'learning_rate':
+            self.agent.learning_rate = new_value
+            # Update optimizer
+            for param_group in self.agent.optimizer.param_groups:
+                param_group['lr'] = new_value
+        elif param == 'gamma':
+            self.agent.gamma = new_value
+        elif param == 'epsilon_decay':
+            self.agent.epsilon_decay = new_value
+        elif param == 'batch_size':
+            self.agent.batch_size = new_value
+        
+        print(f"Meta-adjustment: {param} = {new_value}")
+    
+    def _targeted_hyperparameter_adjustment(self, performance_trend):
+        """Make targeted adjustments based on performance trend"""
+        if performance_trend > 0.1:
+            # Significant improvement - stay the course but slightly increase learning
+            if random.random() < 0.5:
+                self.agent.learning_rate *= 1.05
+                self.agent.learning_rate = min(self.hyper_ranges['learning_rate'][1], self.agent.learning_rate)
+                # Update optimizer
+                for param_group in self.agent.optimizer.param_groups:
+                    param_group['lr'] = self.agent.learning_rate
+                print(f"Meta: Increasing learning rate to {self.agent.learning_rate:.6f}")
+            
+            # Slightly slower epsilon decay to exploit more
+            self.agent.epsilon_decay = max(self.agent.epsilon_decay * 0.98, self.hyper_ranges['epsilon_decay'][0])
+            print(f"Meta: Adjusted epsilon decay to {self.agent.epsilon_decay:.4f}")
+            
+            # Change strategy to exploit
+            self.current_strategy = 'exploit'
+        
+        elif performance_trend < -0.1:
+            # Significant decline - make larger adjustments
+            
+            # Reduce learning rate
+            self.agent.learning_rate *= 0.8
+            self.agent.learning_rate = max(self.hyper_ranges['learning_rate'][0], self.agent.learning_rate)
+            # Update optimizer
+            for param_group in self.agent.optimizer.param_groups:
+                param_group['lr'] = self.agent.learning_rate
+            print(f"Meta: Decreasing learning rate to {self.agent.learning_rate:.6f}")
+            
+            # Faster epsilon decay to encourage exploration
+            self.agent.epsilon_decay = min(self.agent.epsilon_decay * 1.02, self.hyper_ranges['epsilon_decay'][1])
+            print(f"Meta: Adjusted epsilon decay to {self.agent.epsilon_decay:.4f}")
+            
+            # Change strategy to explore
+            self.current_strategy = 'explore'
+        
+        else:
+            # Minor or no change - make small random adjustments
+            param = random.choice(['learning_rate', 'gamma'])
+            
+            if param == 'learning_rate':
+                adjustment = (random.random() - 0.5) * 0.1  # ±5% adjustment
+                self.agent.learning_rate *= (1 + adjustment)
+                self.agent.learning_rate = max(self.hyper_ranges['learning_rate'][0], 
+                                            min(self.hyper_ranges['learning_rate'][1], self.agent.learning_rate))
+                # Update optimizer
+                for param_group in self.agent.optimizer.param_groups:
+                    param_group['lr'] = self.agent.learning_rate
+                print(f"Meta: Fine-tuning learning rate to {self.agent.learning_rate:.6f}")
+                
+            elif param == 'gamma':
+                adjustment = (random.random() - 0.5) * 0.02  # ±1% adjustment
+                self.agent.gamma *= (1 + adjustment)
+                self.agent.gamma = max(self.hyper_ranges['gamma'][0], 
+                                    min(self.hyper_ranges['gamma'][1], self.agent.gamma))
+                print(f"Meta: Fine-tuning gamma to {self.agent.gamma:.4f}")
+            
+            # Occasionally change strategy
+            if random.random() < 0.2:
+                self.current_strategy = random.choice(self.strategies)
+                print(f"Meta: Switching strategy to {self.current_strategy}")
+    
+    def adjust_architecture(self):
+        """Adapt neural network architecture based on performance"""
+        # Don't adjust if architecture is frozen or we don't have enough history
+        if self.architecture_frozen or len(self.performance_history) < 20:
+            return
+        
+        # Get performance trend
+        recent_perf = list(self.performance_history)[-20:]
+        first_half = sum(recent_perf[:10]) / 10
+        second_half = sum(recent_perf[10:]) / 10
+        performance_trend = (second_half - first_half) / max(1, first_half)
+        
+        if performance_trend < -0.05:
+            # Performance is declining - try growing the network
+            if random.random() < 0.7:  # 70% chance to grow
+                self._grow_network()
+            else:
+                self._prune_network()  # Sometimes pruning helps too
+        
+        elif performance_trend > 0.05:
+            # Performance is improving - try pruning for efficiency
+            if random.random() < 0.3:  # 30% chance to grow
+                self._grow_network()
+            else:
+                self._prune_network()  # Focus on pruning when things are good
+        
+        else:
+            # Stable performance - occasional random adjustments
+            if random.random() < 0.5:
+                self._grow_network()
+            else:
+                self._prune_network()
+    
+    def _grow_network(self):
+        """Trigger growth in one of the neural modules"""
+        # Select a random module
+        modules = list(self.agent.modules.keys())
+        module_name = random.choice(modules)
+        module = self.agent.modules[module_name]
+        
+        # Find dynamic layers in the module
+        dynamic_layers = []
+        
+        # Handle different module structures
+        if module_name == 'perception':
+            # Look in feature_extractor
+            for i, layer in enumerate(module.feature_extractor):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append((i, layer))
+        
+        elif module_name == 'navigation':
+            # Look in pathfinder
+            for i, layer in enumerate(module.pathfinder):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append((i, layer))
+        
+        elif module_name == 'executive':
+            # Look in integrator and action_selector
+            for i, layer in enumerate(module.integrator):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append((i, layer))
+            dynamic_layers.append((-1, module.action_selector))
+        
+        # Try to grow a random dynamic layer
+        if dynamic_layers:
+            idx, layer = random.choice(dynamic_layers)
+            # Only grow if current size is less than 80% of max to avoid over-growing
+            if layer.current_output_size < 0.8 * layer.max_output_size:
+                success = layer.grow_neurons()
+                if success:
+                    print(f"Meta: Grew layer in {module_name} module")
+    
+    def _prune_network(self):
+        """Trigger pruning in one of the neural modules"""
+        # Select a random module
+        modules = list(self.agent.modules.keys())
+        module_name = random.choice(modules)
+        module = self.agent.modules[module_name]
+        
+        # Find dynamic layers in the module
+        dynamic_layers = []
+        
+        # Handle different module structures (similar to _grow_network)
+        if module_name == 'perception':
+            for i, layer in enumerate(module.feature_extractor):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append(layer)
+        
+        elif module_name == 'navigation':
+            for i, layer in enumerate(module.pathfinder):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append(layer)
+        
+        elif module_name == 'executive':
+            for i, layer in enumerate(module.integrator):
+                if isinstance(layer, DynamicLayer):
+                    dynamic_layers.append(layer)
+            dynamic_layers.append(module.action_selector)
+        
+        # Try to prune a random dynamic layer
+        if dynamic_layers:
+            layer = random.choice(dynamic_layers)
+            success = layer.prune_connections()
+            if success:
+                print(f"Meta: Pruned connections in {module_name} module")
+    
+    def adjust_learning_strategy(self):
+        """Adjust learning strategy based on performance and environment"""
+        # Only adjust if we have enough history
+        if len(self.performance_history) < 10:
+            return
+        
+        # Calculate average performance
+        avg_performance = sum(self.performance_history) / len(self.performance_history)
+        
+        # Strategies:
+        # - exploit: Focus on exploitation (low epsilon, high gamma)
+        # - explore: Focus on exploration (high epsilon, balanced gamma)
+        # - diversify: Balance between exploration and exploitation
+        
+        if self.current_strategy == 'exploit':
+            # Lower epsilon, higher gamma
+            self.agent.epsilon = max(self.agent.epsilon_min, self.agent.epsilon * 0.9)
+            self.agent.gamma = min(0.99, self.agent.gamma * 1.01)
+            
+        elif self.current_strategy == 'explore':
+            # Higher epsilon, balanced gamma
+            self.agent.epsilon = min(0.3, self.agent.epsilon * 1.1)
+            self.agent.gamma = 0.95  # Mid-range value
+            
+        elif self.current_strategy == 'diversify':
+            # Balanced values
+            self.agent.epsilon = 0.1
+            self.agent.gamma = 0.97
+        
+        # Log current strategy
+        print(f"Learning strategy: {self.current_strategy} (ε={self.agent.epsilon:.2f}, γ={self.agent.gamma:.2f})")
+    
+    def update_curriculum(self, env):
+        """Update curriculum learning parameters based on performance"""
+        # Track episodes at current difficulty
+        self.curriculum_episodes += 1
+        
+        # Compute average performance over recent episodes
+        avg_performance = 0.0
+        if self.performance_history:
+            avg_performance = sum(self.performance_history) / len(self.performance_history)
+        
+        # Update curriculum metrics
+        self.curriculum_performance = 0.9 * self.curriculum_performance + 0.1 * avg_performance
+        
+        # Consider changing difficulty after sufficient episodes
+        if self.curriculum_episodes >= 20:
+            # If performing well, consider increasing difficulty
+            if self.curriculum_performance > DIFFICULTY_ADJUST_THRESHOLD:
+                # Increase difficulty (max 2)
+                if env.difficulty < 2:
+                    env.difficulty += 1
+                    print(f"Curriculum: Increased difficulty to {env.difficulty}")
+                    
+                    # Reset curriculum tracking for new difficulty
+                    self.curriculum_episodes = 0
+                    self.curriculum_performance = 0.0
+                    
+                    # Adjust agent parameters for new difficulty
+                    self.agent.epsilon = min(0.3, self.agent.epsilon * 1.2)  # Increase exploration
+                    
+                    # Apply appropriate skill prototype if available
+                    if env.difficulty == 1:
+                        self.agent.skill_library.apply_prototype(self.agent, 'navigation', 1)
+                    elif env.difficulty == 2:
+                        self.agent.skill_library.apply_prototype(self.agent, 'navigation', 2)
+                        
+            # If performing poorly for a long time, consider decreasing difficulty
+            elif self.curriculum_performance < DIFFICULTY_ADJUST_THRESHOLD * 0.5 and self.curriculum_episodes > 50:
+                # Decrease difficulty (min 0)
+                if env.difficulty > 0:
+                    env.difficulty -= 1
+                    print(f"Curriculum: Decreased difficulty to {env.difficulty}")
+                    
+                    # Reset curriculum tracking for new difficulty
+                    self.curriculum_episodes = 0
+                    self.curriculum_performance = 0.0
+
+# ------------------- Meta-Learning System -------------------
 
 if __name__ == "__main__":
-    integrate_with_snakeRL()
-    # Ejecutar verificación de GPU al importar el módulo
-    check_gpu_compatibility()
+    import argparse
+    
+    # Crear un parser de argumentos para permitir opciones por línea de comandos
+    parser = argparse.ArgumentParser(description='Entrenamiento de agente neuronal avanzado para Snake')
+    parser.add_argument('--episodes', type=int, default=1000, help='Número de episodios para entrenar')
+    parser.add_argument('--save-path', type=str, default='snake_agent.pth', help='Ruta para guardar el agente')
+    parser.add_argument('--new-agent', action='store_true', help='Crear un nuevo agente en lugar de cargar uno existente')
+    parser.add_argument('--difficulty', type=int, default=0, choices=[0, 1, 2], 
+                        help='Dificultad del entorno (0: sin laberinto, 1: laberinto simple, 2: laberinto complejo)')
+    
+    args = parser.parse_args()
+    
+    # Iniciar entrenamiento con los argumentos proporcionados
+    integrate_with_snakeRL(
+        episodes=args.episodes, 
+        save_path=args.save_path, 
+        load_existing=not args.new_agent,
+        difficulty=args.difficulty
+    )

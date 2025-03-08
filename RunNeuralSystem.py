@@ -3,6 +3,17 @@ import os
 import sys
 import time
 import traceback
+import argparse
+
+# Crear un parser de argumentos para permitir opciones por línea de comandos
+parser = argparse.ArgumentParser(description='Ejecutar el sistema neural avanzado para Snake')
+parser.add_argument('--model', type=str, default='snake_agent_fixed.pth', help='Ruta al modelo a cargar')
+parser.add_argument('--episodes', type=int, default=1000, help='Número de episodios para entrenar')
+parser.add_argument('--difficulty', type=int, default=0, choices=[0, 1, 2], 
+                   help='Dificultad del entorno (0: sin laberinto, 1: laberinto simple, 2: laberinto complejo)')
+parser.add_argument('--new-agent', action='store_true', help='Crear un nuevo agente en lugar de cargar uno existente')
+
+args = parser.parse_args()
 
 print(f"\n{'='*60}")
 print(f"SISTEMA NEURAL AVANZADO PARA SNAKE")
@@ -39,6 +50,12 @@ if not os.path.exists("SnakeNeuralAdvanced.py"):
     print("Crea este archivo con el sistema neural avanzado.")
     sys.exit(1)
 
+# Verificar que el modelo existe
+if not args.new_agent and not os.path.exists(args.model):
+    print(f"ERROR: No se encuentra el archivo del modelo {args.model}")
+    print("Asegúrate de que el archivo del modelo exista o usa --new-agent para crear uno nuevo.")
+    sys.exit(1)
+
 # Verificar que se puede importar SnakeGame
 try:
     from SnakeRL import SnakeGame
@@ -69,7 +86,12 @@ try:
     # Ejecutar la función principal
     print("\nEjecutando Sistema Neural Avanzado:")
     if hasattr(SnakeNeuralAdvanced, 'integrate_with_snakeRL'):
-        SnakeNeuralAdvanced.integrate_with_snakeRL()
+        SnakeNeuralAdvanced.integrate_with_snakeRL(
+            episodes=args.episodes,
+            save_path=args.model,
+            load_existing=not args.new_agent,
+            difficulty=args.difficulty
+        )
     else:
         print("ERROR: No se encontró la función 'integrate_with_snakeRL' en el módulo.")
         print("Verifica que el archivo SnakeNeuralAdvanced.py contenga esta función.")
